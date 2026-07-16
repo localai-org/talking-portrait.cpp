@@ -42,6 +42,9 @@ static bool get_cfg(const std::string &cs, case_cfg &c) {
 }
 
 int main(int argc, char **argv) {
+    // parity dumps are true-fp32: disable TF32 in cuBLAS/cuDNN before any
+    // CUDA context exists (ggml enables CUBLAS_TF32_TENSOR_OP_MATH)
+    setenv("NVIDIA_TF32_OVERRIDE", "0", 0);
     std::string gguf_dir, ref_root, out_root = "parity-dumps", case_name;
     std::string device = "cpu", ftype = "f32", families, frames_out;
     bool generate = false;

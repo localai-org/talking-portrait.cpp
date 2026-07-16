@@ -27,21 +27,13 @@ double motion_ae_scale(const std::string &name, const int64_t *ne) {
     return 1.0;
 }
 
-struct menc_plan {
-    plan_t p;
-    std::vector<tap_entry> taps;
-    bool built = false;
-};
-static menc_plan g_menc;  // one per process is fine (single model instance)
-
 static const int RES_IN[7] = {32, 64, 128, 256, 512, 512, 512};
 static const int RES_OUT[7] = {64, 128, 256, 512, 512, 512, 512};
 
 bool motion_enc::run(backend_t &be, const float *image, menc_result &out,
                      tap_sink &tap, std::string &err) {
-    menc_plan &mp = g_menc;
-    if (!mp.built) {
-        plan_t &p = mp.p;
+    if (!built) {
+        plan_t &p = plan;
         p.begin(1024);
         ggml_context *ctx = p.ctx;
         auto need = [&](const std::string &n) -> ggml_tensor * {
@@ -56,7 +48,7 @@ bool motion_enc::run(backend_t &be, const float *image, menc_result &out,
             char nm[64];
             snprintf(nm, sizeof nm, "out.%s", name.c_str());
             p.output(nm, t);
-            mp.taps.push_back({name, t, std::move(sh)});
+            tap_list.push_back({name, t, std::move(sh)});
         };
 
         ggml_tensor *img = p.input("image", ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 512, 512, 3, 1));
@@ -138,15 +130,15 @@ bool motion_enc::run(backend_t &be, const float *image, menc_result &out,
 
         if (!err.empty()) return false;
         if (!p.commit(be, err)) return false;
-        mp.built = true;
+        built = true;
     }
 
-    plan_t &p = mp.p;
+    plan_t &p = plan;
     p.set("image", image);
     if (!p.compute(be, err)) return false;
 
     if (tap) {
-        for (auto &e : mp.taps) tap.pending.push_back(e);
+        for (auto &e : tap_list) tap.pending.push_back(e);
         if (!tap.harvest()) {
             err = tap.err;
             return false;

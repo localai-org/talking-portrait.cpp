@@ -32,6 +32,7 @@ struct fmt_model {
 
     // host helper: timestep embedding freqs table etc built at load
     std::vector<float> t_freqs;  // [t_freq_dim/2]
+    std::vector<float> tf_scratch;  // per-forward t_freq staging (no per-step allocs)
 };
 
 }  // namespace tp

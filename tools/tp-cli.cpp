@@ -3,6 +3,7 @@
 //   tp-cli --gguf DIR --image face.jpg --wav speech.wav --emotion happy \
 //          [--out out.mp4] [--frames out_frames.f32] [--device cpu|gpu]
 //          [--ftype f32|f16] [--seed N] [--threads N]
+#include "cli_args.h"
 #include "tp.h"
 
 #include <cstdint>
@@ -54,34 +55,17 @@ struct mp4_writer {
 };
 
 int main(int argc, char **argv) {
-    std::string gguf, image, wav, emotion = "neutral", out_mp4, out_frames;
-    std::string device = "gpu", ftype = "f32";
-    uint64_t seed = 15;
-    int threads = 0;
-    for (int i = 1; i < argc; i++) {
-        std::string a = argv[i];
-        auto next = [&]() -> const char * { return i + 1 < argc ? argv[++i] : ""; };
-        if (a == "--gguf") gguf = next();
-        else if (a == "--image") image = next();
-        else if (a == "--wav") wav = next();
-        else if (a == "--emotion") emotion = next();
-        else if (a == "--out") out_mp4 = next();
-        else if (a == "--frames") out_frames = next();
-        else if (a == "--device") device = next();
-        else if (a == "--ftype") ftype = next();
-        else if (a == "--seed") seed = strtoull(next(), nullptr, 10);
-        else if (a == "--threads") threads = atoi(next());
-        else {
-            fprintf(stderr, "unknown arg: %s\n", a.c_str());
-            return 2;
-        }
-    }
-    if (gguf.empty() || image.empty() || wav.empty() || (out_mp4.empty() && out_frames.empty())) {
-        fprintf(stderr,
-                "usage: tp-cli --gguf DIR --image IMG --wav WAV [--emotion E] "
-                "(--out X.mp4 | --frames X.f32) [--device cpu|gpu] [--seed N]\n");
+    tp::cli_opts o;
+    std::string perr;
+    if (!tp::cli_parse(argc, argv, o, perr)) {
+        fprintf(stderr, "%s\n", perr.c_str());
         return 2;
     }
+    const std::string &gguf = o.gguf, &image = o.image, &wav = o.wav,
+                      &emotion = o.emotion, &out_mp4 = o.out_mp4,
+                      &out_frames = o.out_frames, &device = o.device, &ftype = o.ftype;
+    const uint64_t seed = o.seed;
+    const int threads = o.threads;
     const int emo = tp_emotion_index(emotion.c_str());
     if (emo < 0) {
         fprintf(stderr, "unknown emotion '%s'\n", emotion.c_str());

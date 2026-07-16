@@ -4,7 +4,7 @@
 #
 #   cmake --preset fuzz && cmake --build --preset fuzz
 #   ./build/fuzz/fuzz/fuzz_wav corpus/wav -max_len=1048576
-foreach(target fuzz_wav fuzz_image fuzz_json)
+foreach(target fuzz_wav fuzz_image fuzz_json fuzz_cliargs)
     add_executable(${target} ${target}.cpp)
     target_link_libraries(${target} PRIVATE tp)
     target_include_directories(${target} PRIVATE ${CMAKE_SOURCE_DIR}/src)

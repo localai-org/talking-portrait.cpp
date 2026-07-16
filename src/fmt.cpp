@@ -163,13 +163,13 @@ bool fmt_model::forward(backend_t &be, const float *x60, const float *cond, floa
     p.set("mask", mask_f32.data());
 
     const int half = t_freq_dim / 2;
-    std::vector<float> tf((size_t) t_freq_dim);
+    tf_scratch.resize((size_t) t_freq_dim);
     for (int k = 0; k < half; k++) {
         const float a = t * t_freqs[(size_t) k];
-        tf[(size_t) k] = cosf(a);
-        tf[(size_t) (half + k)] = sinf(a);
+        tf_scratch[(size_t) k] = cosf(a);
+        tf_scratch[(size_t) (half + k)] = sinf(a);
     }
-    p.set("t_freq", tf.data());
+    p.set("t_freq", tf_scratch.data());
 
     if (!p.compute(be, err)) return false;
 

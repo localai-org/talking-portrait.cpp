@@ -19,6 +19,11 @@ struct menc_result {
 struct motion_enc {
     weights_t *w = nullptr;  // shared motion_ae weights (enc.* + dec.direction.Q)
 
+    plan_t plan;  // static graph, built on first run (member: must be freed
+                  // before the backend, never from a static destructor)
+    std::vector<tap_entry> tap_list;
+    bool built = false;
+
     bool run(backend_t &be, const float *image, menc_result &out, tap_sink &tap,
              std::string &err);
 };
