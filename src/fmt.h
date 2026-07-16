@@ -16,6 +16,7 @@ struct fmt_model {
 
     plan_t step;  // static CFG-batched forward graph
     std::vector<int32_t> mask_i32;  // [60*60] 1 = masked (tap layout)
+    std::vector<float> mask_f32;    // additive mask, re-set every forward
 
     bool load(const std::string &gguf_path, backend_t &be, std::string &err);
     bool build(backend_t &be, std::string &err);

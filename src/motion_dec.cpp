@@ -198,8 +198,10 @@ struct mdec_build {
             ib = ggml_mul(ctx, ib,
                           ggml_mul(ctx, ggml_clamp(ctx, ggml_scale_bias(ctx, cy, 1.0f, 1.0f), 0.0f, 1.0f),
                                    ggml_clamp(ctx, ggml_scale_bias(ctx, cy, -1.0f, (float) r), 0.0f, 1.0f)));
-            ggml_tensor *xc = ggml_clamp(ctx, cx, 0.0f, (float) (r - 1));
-            ggml_tensor *yc = ggml_clamp(ctx, cy, 0.0f, (float) (r - 1));
+            // ggml_clamp is an IN-PLACE view op — clamp a fresh copy, since
+            // cx/cy are shared across the four corner terms
+            ggml_tensor *xc = ggml_clamp(ctx, ggml_scale(ctx, cx, 1.0f), 0.0f, (float) (r - 1));
+            ggml_tensor *yc = ggml_clamp(ctx, ggml_scale(ctx, cy, 1.0f), 0.0f, (float) (r - 1));
             ggml_tensor *idx = ggml_add(ctx, xc, ggml_scale(ctx, yc, (float) r));
             idx = ggml_cast(ctx, ggml_reshape_1d(ctx, idx, (int64_t) r * r), GGML_TYPE_I32);
             ggml_tensor *g = ggml_get_rows(ctx, feat_t, idx);  // [C, r*r]
@@ -219,35 +221,82 @@ struct mdec_build {
 
 bool motion_dec::build(backend_t &be, bool with_taps, std::string &err) {
     frame.release();
+
+    // persistent constants: allocated once in their own backend buffer so
+    // gallocr can never hand their memory to later graph nodes
+    ggml_tensor *masks[7], *xs_x[7], *xs_y[7], *feats[7], *onec;
+    if (!cctx) {
+        ggml_init_params cp = {ggml_tensor_overhead() * 32, nullptr, true};
+        cctx = ggml_init(cp);
+        auto mk = [&](const char *nm, int64_t a, int64_t b) {
+            ggml_tensor *t = ggml_new_tensor_2d(cctx, GGML_TYPE_F32, a, b);
+            ggml_set_name(t, nm);
+            consts[nm] = t;
+            return t;
+        };
+        for (int j = 0; j < 7; j++) {
+            const int r = 8 << j;
+            char nm[24];
+            snprintf(nm, sizeof nm, "mask%d", j);
+            mk(nm, r, r);
+            snprintf(nm, sizeof nm, "xsx%d", j);
+            mk(nm, r, r);
+            snprintf(nm, sizeof nm, "xsy%d", j);
+            mk(nm, r, r);
+            snprintf(nm, sizeof nm, "feat%d", j);
+            // channels of feat j == ST_OC[j] (conv{6-j} channels match stage OC)
+            mk(nm, ST_OC[j], (int64_t) r * r);
+        }
+        mk("one", 1, 1);
+        cbuf = ggml_backend_alloc_ctx_tensors(cctx, be.be);
+        if (!cbuf) {
+            err = "failed to allocate mdec const buffer";
+            return false;
+        }
+        // fill masks / identity grids / one
+        std::vector<float> buf;
+        const float one = 1.0f;
+        ggml_backend_tensor_set(consts["one"], &one, 0, 4);
+        for (int j = 0; j < 7; j++) {
+            const int r = 8 << j;
+            char nm[24];
+            buf.assign((size_t) r * r, 0.0f);
+            for (int y = 0; y < r; y += 2)
+                for (int x = 0; x < r; x += 2) buf[(size_t) y * r + x] = 1.0f;
+            snprintf(nm, sizeof nm, "mask%d", j);
+            ggml_backend_tensor_set(consts[nm], buf.data(), 0, (size_t) r * r * 4);
+            std::vector<double> lin((size_t) r);
+            for (int i = 0; i < r; i++) lin[(size_t) i] = -1.0 + 2.0 * i / (r - 1);
+            for (int y = 0; y < r; y++)
+                for (int x = 0; x < r; x++) buf[(size_t) y * r + x] = (float) lin[(size_t) x];
+            snprintf(nm, sizeof nm, "xsx%d", j);
+            ggml_backend_tensor_set(consts[nm], buf.data(), 0, (size_t) r * r * 4);
+            for (int y = 0; y < r; y++)
+                for (int x = 0; x < r; x++) buf[(size_t) y * r + x] = (float) lin[(size_t) y];
+            snprintf(nm, sizeof nm, "xsy%d", j);
+            ggml_backend_tensor_set(consts[nm], buf.data(), 0, (size_t) r * r * 4);
+        }
+    }
+    for (int j = 0; j < 7; j++) {
+        char nm[24];
+        snprintf(nm, sizeof nm, "mask%d", j);
+        masks[j] = consts[nm];
+        snprintf(nm, sizeof nm, "xsx%d", j);
+        xs_x[j] = consts[nm];
+        snprintf(nm, sizeof nm, "xsy%d", j);
+        xs_y[j] = consts[nm];
+        snprintf(nm, sizeof nm, "feat%d", j);
+        feats[j] = consts[nm];
+    }
+    onec = consts["one"];
+
     plan_t &p = frame;
     p.begin(4096);
     ggml_context *ctx = p.ctx;
     mdec_build B{p, ctx, w, derived};
 
     B.latent = p.input("style", ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 512, 1));
-    B.one = p.input("one", ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, 1));
-
-    // constant inputs: zero-stuff masks and identity grids per resolution
-    ggml_tensor *masks[8];  // masks[j]: [8<<j, 8<<j] checker (even coords = 1)
-    ggml_tensor *xs_x[7], *xs_y[7];
-    for (int j = 0; j < 7; j++) {
-        const int r = 8 << j;
-        char nm[24];
-        snprintf(nm, sizeof nm, "mask%d", j);
-        masks[j] = p.input(nm, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, r, r));
-        snprintf(nm, sizeof nm, "xsx%d", j);
-        xs_x[j] = p.input(nm, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, r, r));
-        snprintf(nm, sizeof nm, "xsy%d", j);
-        xs_y[j] = p.input(nm, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, r, r));
-    }
-    ggml_tensor *feats[7];
-    for (int j = 0; j < 7; j++) {
-        const int r = 8 << j;
-        char nm[24];
-        snprintf(nm, sizeof nm, "feat%d", j);
-        // channels of feat j == ST_OC[j] (conv{6-j} channels match stage OC)
-        feats[j] = p.input(nm, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ST_OC[j], (int64_t) r * r));
-    }
+    B.one = onec;
 
     std::vector<tap_entry> taps;
     auto reg = [&](const std::string &name, ggml_tensor *t, std::vector<int64_t> sh) {
@@ -366,32 +415,6 @@ bool motion_dec::build(backend_t &be, bool with_taps, std::string &err) {
     }
     if (!p.commit(be, err)) return false;
 
-    // constant inputs
-    const float one = 1.0f;
-    p.set("one", &one);
-    std::vector<float> buf;
-    for (int j = 0; j < 7; j++) {
-        const int r = 8 << j;
-        buf.assign((size_t) r * r, 0.0f);
-        for (int y = 0; y < r; y += 2)
-            for (int x = 0; x < r; x += 2) buf[(size_t) y * r + x] = 1.0f;
-        char nm[24];
-        snprintf(nm, sizeof nm, "mask%d", j);
-        p.set(nm, buf.data());
-        // identity grid: np.linspace(-1,1,r) meshgrid
-        std::vector<double> lin((size_t) r);
-        for (int i = 0; i < r; i++) lin[(size_t) i] = -1.0 + 2.0 * i / (r - 1);
-        buf.assign((size_t) r * r, 0.0f);
-        for (int y = 0; y < r; y++)
-            for (int x = 0; x < r; x++) buf[(size_t) y * r + x] = (float) lin[(size_t) x];
-        snprintf(nm, sizeof nm, "xsx%d", j);
-        p.set(nm, buf.data());
-        for (int y = 0; y < r; y++)
-            for (int x = 0; x < r; x++) buf[(size_t) y * r + x] = (float) lin[(size_t) y];
-        snprintf(nm, sizeof nm, "xsy%d", j);
-        p.set(nm, buf.data());
-    }
-
     tap_list = std::move(taps);
     taps_in_graph = with_taps;
     built = true;
@@ -406,12 +429,12 @@ bool motion_dec::set_feats(const menc_result &m, std::string &err) {
     for (int j = 0; j < 7; j++) {
         char nm[16];
         snprintf(nm, sizeof nm, "feat%d", j);
-        ggml_tensor *t = frame[nm];
+        ggml_tensor *t = consts[nm];
         if (!t || (int64_t) m.feats[(size_t) j].size() != ggml_nelements(t)) {
             err = "feat size mismatch";
             return false;
         }
-        frame.set(nm, m.feats[(size_t) j].data());
+        ggml_backend_tensor_set(t, m.feats[(size_t) j].data(), 0, ggml_nbytes(t));
     }
     return true;
 }
@@ -421,7 +444,8 @@ bool motion_dec::decode(backend_t &be, const float *style, float *img_out,
     frame.set("style", style);
     if (!frame.compute(be, err)) return false;
     if (tap) {
-        for (auto &e : tap_list) tap.pending.push_back(e);
+        for (auto &e : tap_list)
+            tap.pending.push_back({tap.prefix + e.name, e.t, e.shape});
         if (!tap.harvest()) {
             err = tap.err;
             return false;
@@ -438,9 +462,14 @@ void motion_dec::release() {
     frame.release();
     if (dbuf) ggml_backend_buffer_free(dbuf);
     if (dctx) ggml_free(dctx);
+    if (cbuf) ggml_backend_buffer_free(cbuf);
+    if (cctx) ggml_free(cctx);
     dbuf = nullptr;
     dctx = nullptr;
+    cbuf = nullptr;
+    cctx = nullptr;
     derived.clear();
+    consts.clear();
     built = false;
 }
 

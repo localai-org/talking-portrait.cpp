@@ -15,6 +15,12 @@ struct motion_dec {
     ggml_backend_buffer_t dbuf = nullptr;
     std::map<std::string, ggml_tensor *> derived;
 
+    // persistent constants OUTSIDE gallocr (its free-list reuses graph-input
+    // memory mid-compute): warp feats, zero-stuff masks, identity grids
+    ggml_context *cctx = nullptr;
+    ggml_backend_buffer_t cbuf = nullptr;
+    std::map<std::string, ggml_tensor *> consts;
+
     plan_t frame;      // static per-frame graph (built once per process)
     bool built = false;
     bool taps_in_graph = false;  // frame plan variant with tap outputs

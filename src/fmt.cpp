@@ -147,10 +147,11 @@ bool fmt_model::build(backend_t &be, std::string &err) {
     if (!err.empty()) return false;
     if (!p.commit(be, err)) return false;
 
-    // static banded mask (additive: 0 = attend, -inf = masked)
-    std::vector<float> m((size_t) T * T);
-    for (size_t i = 0; i < m.size(); i++) m[i] = mask_i32[i] ? -INFINITY : 0.0f;
-    p.set("mask", m.data());
+    // additive banded mask (0 = attend, -inf = masked); NOTE: re-set every
+    // forward — gallocr may reuse graph-input memory mid-compute
+    mask_f32.resize((size_t) T * T);
+    for (size_t i = 0; i < mask_f32.size(); i++)
+        mask_f32[i] = mask_i32[i] ? -INFINITY : 0.0f;
     return true;
 }
 
@@ -159,6 +160,7 @@ bool fmt_model::forward(backend_t &be, const float *x60, const float *cond, floa
     plan_t &p = step;
     p.set("x", x60);
     p.set("cond", cond);
+    p.set("mask", mask_f32.data());
 
     const int half = t_freq_dim / 2;
     std::vector<float> tf((size_t) t_freq_dim);
