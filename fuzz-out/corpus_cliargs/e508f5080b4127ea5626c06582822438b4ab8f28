@@ -1,0 +1,1 @@
+--gguf g --image i --wav w --out 4 --device cpu --ftype f16 --seed 42 --threads 8

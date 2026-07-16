@@ -19,6 +19,10 @@ bool tp_ctx::load(const char *gguf_dir, const char *device, int n_threads,
         return false;
     }
     if (!be.init(device, n_threads, err)) return false;
+    const bool f16 = ft == "f16";
+    audio.w.keep_f16 = f16;
+    fmt.w.keep_f16 = f16;
+    motion_ae.keep_f16 = f16;
     if (!audio.load(dir + "/audio_" + ft + ".gguf", be, err)) return false;
     if (!fmt.load(dir + "/fmt_" + ft + ".gguf", be, err)) return false;
     if (!fmt.build(be, err)) return false;

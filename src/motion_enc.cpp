@@ -7,23 +7,40 @@
 
 namespace tp {
 
-// Equal* runtime scales folded at load (see docs/WEIGHTS.md)
+// Equal* runtime scales folded at load (see docs/WEIGHTS.md), PLUS constant
+// folding of the FusedLeakyReLU sqrt(2) (leaky is positively homogeneous:
+// sqrt2*leaky(x+b) == leaky(sqrt2*x + sqrt2*b)) and of the ResBlock 1/sqrt2:
+//   (sqrt2*leaky(conv2+b) + skip)/sqrt2 == leaky(conv2 + b) + skip/sqrt2
 double motion_ae_scale(const std::string &name, const int64_t *ne) {
+    const double SQRT2 = 1.4142135623730951;
     auto ends_with = [&](const char *s) {
         size_t n = strlen(s);
         return name.size() >= n && name.compare(name.size() - n, n, s) == 0;
     };
-    if (!ends_with(".weight") && name != "enc.net_app.convs.8.weight") return 1.0;
+    // FusedLeakyReLU biases (menc stem/conv1 + ToRGB inner): x sqrt2
+    if (name == "enc.net_app.convs.0.1.bias" || ends_with(".conv1.1.bias") ||
+        ends_with(".activate.bias") ||
+        (name.rfind("dec.to_rgbs.", 0) == 0 && ends_with(".conv.1.bias")))
+        return SQRT2;
+    if (!ends_with(".weight")) return 1.0;
     if (name.rfind("dec.direction", 0) == 0) return 1.0;
     if (ends_with("noise.weight")) return 1.0;
     if (ends_with("modulation.weight")) return 1.0 / sqrt((double) ne[0]);
     if (name.rfind("enc.fc.", 0) == 0) return 1.0 / sqrt((double) ne[0]);
-    // conv weights: EqualConv2d / ModulatedConv2d scale = 1/sqrt(IC*k*k)
-    if (ends_with(".conv1.0.weight") || ends_with(".conv2.1.weight") ||
-        ends_with(".skip.1.weight") || name == "enc.net_app.convs.0.0.weight" ||
-        name == "enc.net_app.convs.8.weight" || ends_with(".conv.weight") ||
-        ends_with(".conv.0.weight"))
-        return 1.0 / sqrt((double) (ne[0] * ne[1] * ne[2]));
+    const double conv = 1.0 / sqrt((double) (ne[0] * ne[1] * ne[2]));
+    // menc convs followed by FLReLU: x sqrt2 (conv2's sqrt2 cancels with the
+    // ResBlock 1/sqrt2; skip takes the 1/sqrt2)
+    if (name == "enc.net_app.convs.0.0.weight" || ends_with(".conv1.0.weight"))
+        return conv * SQRT2;
+    if (ends_with(".conv2.1.weight")) return conv;
+    if (ends_with(".skip.1.weight")) return conv / SQRT2;
+    if (name == "enc.net_app.convs.8.weight") return conv;
+    // ToRGB EqualConv2d feeds its FLReLU: x sqrt2
+    if (name.rfind("dec.to_rgbs.", 0) == 0 && ends_with(".conv.0.weight"))
+        return conv * SQRT2;
+    // ModulatedConv2d raw weights (demod convs get their sqrt2 via S_aug/2;
+    // ToFlow has no activation)
+    if (ends_with(".conv.weight")) return conv;
     return 1.0;
 }
 
@@ -82,7 +99,7 @@ bool motion_enc::run(backend_t &be, const float *image, menc_result &out,
             ggml_tensor *ksc = ggml_repeat_4d(ctx, ggml_reshape_4d(ctx, ks, 4, 4, 1, 1), 4, 4, 1, C);
             ggml_tensor *sb = blur(ctx, x, ksc, 1, 1);
             ggml_tensor *sk = conv2d(ctx, ws, sb, 2, 0);
-            x = ggml_scale(ctx, ggml_add(ctx, x2, sk), 0.70710678118654752f);
+            x = ggml_add(ctx, x2, sk);  // 1/sqrt2 folded into weights
             res /= 2;
             char tn[24];
             snprintf(tn, sizeof tn, "menc.conv%d", i);

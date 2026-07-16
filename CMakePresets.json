@@ -16,7 +16,9 @@
       "name": "release",
       "binaryDir": "${sourceDir}/build/release",
       "generator": "Ninja",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
     },
     {
       "name": "cuda",
@@ -25,7 +27,8 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "TP_CUDA": "ON",
-        "CMAKE_CUDA_ARCHITECTURES": "120"
+        "CMAKE_CUDA_ARCHITECTURES": "120",
+        "GGML_CUDA_GRAPHS": "ON"
       }
     },
     {
@@ -41,13 +44,37 @@
     }
   ],
   "buildPresets": [
-    { "name": "debug",   "configurePreset": "debug" },
-    { "name": "release", "configurePreset": "release" },
-    { "name": "cuda",    "configurePreset": "cuda" },
-    { "name": "fuzz",    "configurePreset": "fuzz" }
+    {
+      "name": "debug",
+      "configurePreset": "debug"
+    },
+    {
+      "name": "release",
+      "configurePreset": "release"
+    },
+    {
+      "name": "cuda",
+      "configurePreset": "cuda"
+    },
+    {
+      "name": "fuzz",
+      "configurePreset": "fuzz"
+    }
   ],
   "testPresets": [
-    { "name": "debug",   "configurePreset": "debug",   "output": { "outputOnFailure": true } },
-    { "name": "release", "configurePreset": "release", "output": { "outputOnFailure": true } }
+    {
+      "name": "debug",
+      "configurePreset": "debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "release",
+      "configurePreset": "release",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
   ]
 }

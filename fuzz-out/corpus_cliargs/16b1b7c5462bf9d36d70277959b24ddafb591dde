@@ -1,0 +1,1 @@
+--gguf g --image i.png --wav wav --emotion happy --frames o.f32

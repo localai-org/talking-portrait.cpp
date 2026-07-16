@@ -143,7 +143,12 @@ bool weights_t::load(const std::string &path, backend_t &be, const char *expect_
     };
     ctx = ggml_init(cp);
     for (auto &t : infos) {
-        ggml_tensor *d = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, t.ne);
+        // fast path keeps f16 only for the big GEMM/conv weights; small
+        // tensors (biases, blur kernels) dequantize to f32 so elementwise
+        // ops stay single-type
+        const bool big = t.n >= 4096;
+        const ggml_type tt = (keep_f16 && t.gtype == 1 && big) ? GGML_TYPE_F16 : GGML_TYPE_F32;
+        ggml_tensor *d = ggml_new_tensor(ctx, tt, GGML_MAX_DIMS, t.ne);
         ggml_set_name(d, t.name.c_str());
         map[t.name] = d;
     }
@@ -173,7 +178,14 @@ bool weights_t::load(const std::string &path, backend_t &be, const char *expect_
             const float fs = (float) s;
             for (int64_t j = 0; j < t.n; j++) f32[(size_t) j] *= fs;
         }
-        ggml_backend_tensor_set(map[t.name], f32.data(), 0, (size_t) t.n * 4);
+        ggml_tensor *dst = map[t.name];
+        if (dst->type == GGML_TYPE_F16) {
+            std::vector<ggml_fp16_t> h16((size_t) t.n);
+            for (int64_t j = 0; j < t.n; j++) h16[(size_t) j] = ggml_fp32_to_fp16(f32[(size_t) j]);
+            ggml_backend_tensor_set(dst, h16.data(), 0, (size_t) t.n * 2);
+        } else {
+            ggml_backend_tensor_set(dst, f32.data(), 0, (size_t) t.n * 4);
+        }
         for (const std::string &wname : want_host) {
             if (wname == t.name) host[t.name] = f32;
         }
