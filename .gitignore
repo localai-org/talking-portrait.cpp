@@ -1,3 +1,7 @@
-build*/
+build/
 parity-dumps/
 videos/
+bench.json
+fuzz-evidence.txt
+alloc-evidence.txt
+compile_commands.json
