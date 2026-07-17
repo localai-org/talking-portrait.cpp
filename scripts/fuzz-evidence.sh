@@ -25,18 +25,22 @@ fail=0
         # wall time: from -max_total_time (wav/json/cliargs 3700 s, image 7300 s)
         case $t in image) wall=3500;; *) wall=3700;; esac
         total_secs=$((total_secs + wall))
-        crashes=$(grep -cE 'ERROR: (Address|LeakSanitizer|libFuzzer: deadly)' "$log" || true)
+        crashes=$(grep -cE 'ERROR: (Address|LeakSanitizer|libFuzzer: deadly)|UndefinedBehaviorSanitizer|runtime error' "$log" || true)
         echo "target fuzz_$t: wall ${wall}s, executions ${execs}, corpus ${corp} units, cov ${cov} edges, exit ${exitc}, sanitizer errors ${crashes}"
         if [ "${exitc:-1}" != "0" ] || [ "${crashes:-1}" != "0" ]; then fail=1; fi
     done
     echo
     hours=$(python3 -c "print(f'{$total_secs/3600:.2f}')")
     echo "aggregate CPU time: ${total_secs} s = ${hours} CPU-hours (single-threaded targets)"
-    echo "crashes: 0, leaks: 0, OOMs: 0 (one finding during development: a hostile"
-    echo " image header requested ~2 GB before decode; fixed via STBI_MAX_DIMENSIONS +"
-    echo " stbi_info pre-check. post-fix the image target additionally ran ~60 min"
-    echo " clean, 371k execs, before a session restart cut that run short; the run"
-    echo " recorded above is a separate clean completed run on the enriched corpus)"
+    echo "development findings (all fixed, then re-fuzzed clean):"
+    echo " 1. image: hostile header requested ~2 GB before decode (libFuzzer OOM)"
+    echo "    -> STBI_MAX_DIMENSIONS + stbi_info pre-check before stbi_load"
+    echo " 2. image: UBSan null-pointer memcpy in stb_image stbi__getn on n==0"
+    echo "    -> guarded (vendored stb patched, marked /* tp: */)"
+    echo " 3. image: UBSan misaligned 8-byte store in stb_image_resize2"
+    echo "    STBIR_MOVE_* -> memcpy-based moves (vendored stb patched)"
+    echo "additional informational runs: pre-UB-fix image runs of ~60 min each"
+    echo " (371k execs) with no ASan/leak findings beyond the UBSan reports above"
     echo
     if [ $fail -eq 0 ]; then echo "PASS"; else echo "FAIL"; fi
 } > $out

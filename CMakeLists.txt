@@ -29,6 +29,7 @@ if (TP_FUZZ)
     set(TP_FUZZ_SANITIZERS "address,undefined" CACHE STRING "fuzz sanitizers")
     # global: instrument ggml + lib + harnesses end-to-end
     add_compile_options(-fsanitize=${TP_FUZZ_SANITIZERS} -fsanitize=fuzzer-no-link
+                        -fno-sanitize-recover=undefined
                         -fno-omit-frame-pointer -g -O1)
     add_link_options(-fsanitize=${TP_FUZZ_SANITIZERS})
 endif()

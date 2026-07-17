@@ -3695,12 +3695,12 @@ static void stbir__cleanup_gathered_coefficients( stbir_edge edge, stbir__filter
 
 static int stbir__pack_coefficients( int num_contributors, stbir__contributors* contributors, float * coefficents, int coefficient_width, int widest, int row0, int row1 ) 
 {
-  #define STBIR_MOVE_1( dest, src ) { STBIR_NO_UNROLL(dest); ((stbir_uint32*)(dest))[0] = ((stbir_uint32*)(src))[0]; }
-  #define STBIR_MOVE_2( dest, src ) { STBIR_NO_UNROLL(dest); ((stbir_uint64*)(dest))[0] = ((stbir_uint64*)(src))[0]; }
+  #define STBIR_MOVE_1( dest, src ) { STBIR_NO_UNROLL(dest); memcpy( (dest), (src), sizeof(stbir_uint32) ); /* tp: unaligned-safe */ }
+  #define STBIR_MOVE_2( dest, src ) { STBIR_NO_UNROLL(dest); memcpy( (dest), (src), sizeof(stbir_uint64) ); /* tp: unaligned-safe */ }
   #ifdef STBIR_SIMD
   #define STBIR_MOVE_4( dest, src ) { stbir__simdf t; STBIR_NO_UNROLL(dest); stbir__simdf_load( t, src ); stbir__simdf_store( dest, t ); }
   #else
-  #define STBIR_MOVE_4( dest, src ) { STBIR_NO_UNROLL(dest); ((stbir_uint64*)(dest))[0] = ((stbir_uint64*)(src))[0]; ((stbir_uint64*)(dest))[1] = ((stbir_uint64*)(src))[1]; }
+  #define STBIR_MOVE_4( dest, src ) { STBIR_NO_UNROLL(dest); memcpy( (dest), (src), 2*sizeof(stbir_uint64) ); /* tp: unaligned-safe */ }
   #endif
 
   int row_end = row1 + 1;
