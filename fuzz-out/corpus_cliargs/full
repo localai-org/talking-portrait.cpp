@@ -1,1 +1,0 @@
---gguf g --image i --wav w --out o.mp4 --device cpu --ftype f16 --seed 42 --threads 8

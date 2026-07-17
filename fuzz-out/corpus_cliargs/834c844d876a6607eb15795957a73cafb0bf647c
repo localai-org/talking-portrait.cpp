@@ -1,1 +1,0 @@
---gguf e --image i --wav w --image i --out o --image i --wav i --wav w --out o --seed 42 -ead

@@ -1,1 +1,0 @@
-{"case":"a-short","n_frames":50,"n_chunks":1,"emotion":"happy","taps":{"aud.proj":{"shape":[1,50,512],"dtype":"f32"}}}

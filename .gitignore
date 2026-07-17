@@ -5,3 +5,6 @@ bench.json
 fuzz-evidence.txt
 alloc-evidence.txt
 compile_commands.json
+fuzz-out/
+videos-f16/
+parity-dumps-f16/
