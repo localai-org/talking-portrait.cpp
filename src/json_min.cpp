@@ -223,7 +223,7 @@ void write_val(std::string &o, const jval &v, int indent, int level) {
         case jval::BOOL: o += v.b ? "true" : "false"; break;
         case jval::NUM: {
             char buf[64];
-            if (v.num == (int64_t) v.num && std::fabs(v.num) < 1e15)
+            if (std::fabs(v.num) < 1e15 && v.num == (double) (int64_t) v.num)
                 snprintf(buf, sizeof buf, "%lld", (long long) v.num);
             else
                 snprintf(buf, sizeof buf, "%.9g", v.num);

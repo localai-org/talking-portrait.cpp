@@ -18,8 +18,14 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             for (auto &kv : taps->obj) {
                 const tp::jval *sh = kv.second.find("shape");
                 if (sh && sh->kind == tp::jval::ARR) {
-                    long long n = 1;
-                    for (auto &d : sh->arr) n *= (long long) d.num;
+                    int64_t n = 1;
+                    for (auto &d : sh->arr) {
+                        int64_t dim = 0;
+                        if (!tp::json_i64(d.num, 0, 1 << 24, dim) ||
+                            (dim && n > (((int64_t) 1 << 31) / dim)))
+                            break;
+                        n *= dim;
+                    }
                     (void) n;
                 }
             }

@@ -94,8 +94,11 @@ bool fixture::load(const std::string &case_dir, std::string &err) {
         return false;
     }
     case_name = meta.str_or("case", "");
-    n_frames = (int64_t) meta.num_or("n_frames", 0);
-    n_chunks = (int64_t) meta.num_or("n_chunks", 0);
+    if (!json_i64(meta.num_or("n_frames", 0), 1, 1000000, n_frames) ||
+        !json_i64(meta.num_or("n_chunks", 0), 1, 100000, n_chunks)) {
+        err = case_dir + ": bad meta.json (n_frames/n_chunks out of range)";
+        return false;
+    }
     const std::string emo = meta.str_or("emotion", "");
     for (int i = 0; i < TP_N_EMOTIONS; i++)
         if (emo == EMOTIONS[i]) emotion = i;
@@ -152,13 +155,23 @@ bool load_ref_tap(const std::string &case_dir, const std::string &name,
     }
     shape.clear();
     const jval *sh = e->find("shape");
-    if (!sh || sh->kind != jval::ARR) {
+    if (!sh || sh->kind != jval::ARR || sh->arr.size() > 8) {
         err = "bad shape for " + name;
         return false;
     }
-    for (auto &d : sh->arr) shape.push_back((int64_t) d.num);
+    int64_t count = 1;
+    for (auto &d : sh->arr) {
+        int64_t dim = 0;
+        if (d.kind != jval::NUM || !json_i64(d.num, 0, 1 << 24, dim) ||
+            count > (int64_t) 1 << 31 || (dim && count > ((int64_t) 1 << 31) / dim)) {
+            err = "shape out of range for " + name;
+            return false;
+        }
+        count *= dim;
+        shape.push_back(dim);
+    }
     if (!read_f32_file(case_dir + "/" + name + ".f32", out, err)) return false;
-    if ((int64_t) out.size() != nelems(shape)) {
+    if ((int64_t) out.size() != count) {
         err = "size mismatch for " + name;
         return false;
     }

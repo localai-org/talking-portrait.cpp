@@ -37,6 +37,17 @@ struct jval {
 // returns false on malformed input; err gets a short reason
 bool json_parse(const std::string &text, jval &out, std::string &err);
 
+// bounded double->int64 for untrusted JSON numbers: rejects non-integral
+// values and anything outside [lo, hi] (casting an out-of-range double to
+// an integer type is UB — fuzz finding)
+inline bool json_i64(double x, int64_t lo, int64_t hi, int64_t &out) {
+    if (!(x >= (double) lo && x <= (double) hi)) return false;
+    const int64_t v = (int64_t) x;  // safe: bounded
+    if ((double) v != x) return false;
+    out = v;
+    return true;
+}
+
 // serializer used for our meta.json (2-space indent, stable order)
 std::string json_write(const jval &v, int indent = 0);
 
