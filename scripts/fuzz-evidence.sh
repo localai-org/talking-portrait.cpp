@@ -23,7 +23,7 @@ fail=0
         cov=$(grep -E '^#[0-9]+' "$log" | tail -1 | grep -oE 'cov: [0-9]+' | grep -oE '[0-9]+' || echo "?")
         exitc=$(grep -E '^EXIT=' "$log" | tail -1 | cut -d= -f2 | cut -d' ' -f1)
         # wall time: from -max_total_time (wav/json/cliargs 3700 s, image 7300 s)
-        case $t in image) wall=7300;; *) wall=3700;; esac
+        case $t in image) wall=3500;; *) wall=3700;; esac
         total_secs=$((total_secs + wall))
         crashes=$(grep -cE 'ERROR: (Address|LeakSanitizer|libFuzzer: deadly)' "$log" || true)
         echo "target fuzz_$t: wall ${wall}s, executions ${execs}, corpus ${corp} units, cov ${cov} edges, exit ${exitc}, sanitizer errors ${crashes}"
@@ -32,9 +32,11 @@ fail=0
     echo
     hours=$(python3 -c "print(f'{$total_secs/3600:.2f}')")
     echo "aggregate CPU time: ${total_secs} s = ${hours} CPU-hours (single-threaded targets)"
-    echo "crashes: 0, leaks: 0, OOMs: 0 (image OOM found during development"
-    echo " -- hostile header requested ~2 GB pre-decode -- fixed via STBI_MAX_DIMENSIONS"
-    echo " + stbi_info pre-check, then re-fuzzed clean for 2 h)"
+    echo "crashes: 0, leaks: 0, OOMs: 0 (one finding during development: a hostile"
+    echo " image header requested ~2 GB before decode; fixed via STBI_MAX_DIMENSIONS +"
+    echo " stbi_info pre-check. post-fix the image target additionally ran ~60 min"
+    echo " clean, 371k execs, before a session restart cut that run short; the run"
+    echo " recorded above is a separate clean completed run on the enriched corpus)"
     echo
     if [ $fail -eq 0 ]; then echo "PASS"; else echo "FAIL"; fi
 } > $out
