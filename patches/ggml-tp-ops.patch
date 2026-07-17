@@ -445,6 +445,349 @@ index 28c79ab4..f83f4794 100644
  
      const int64_t IC = src1->ne[is_2D ? 2 : 1];
      const int64_t IH = is_2D ? src1->ne[1] : 1;
+diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
+index 1b1150e7..130ec734 100644
+--- a/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -899,6 +899,8 @@ struct vk_device_struct {
+     std::map<vk_solve_tri_pipeline_state, vk_pipeline> pipeline_solve_tri_f32;
+     vk_pipeline pipeline_im2col_f32, pipeline_im2col_f32_f16;
+     vk_pipeline pipeline_im2col_3d_f32, pipeline_im2col_3d_f32_f16;
++    vk_pipeline pipeline_im2col_cf_f32, pipeline_im2col_cf_f32_f16;
++    vk_pipeline pipeline_bilinear_gather_f32, pipeline_bilinear_gather_f16_f32;
+     vk_pipeline pipeline_timestep_embedding_f32;
+     vk_pipeline pipeline_conv_transpose_1d_f32;
+     vk_pipeline pipeline_snake_f32;
+@@ -1525,6 +1527,29 @@ struct vk_op_timestep_embedding_push_constants {
+     uint32_t max_period;
+ };
+ 
++struct vk_op_im2col_cf_push_constants {
++    uint32_t IC;
++    uint32_t IW;
++    uint32_t IH;
++    uint32_t OW;
++    uint32_t OH;
++    uint32_t KW;
++    uint32_t R;   // IC*KW*KH
++    int32_t s0;
++    int32_t s1;
++    int32_t p0;
++    int32_t p1;
++    int32_t d0;
++    int32_t d1;
++};
++
++struct vk_op_bilinear_gather_push_constants {
++    uint32_t C;
++    uint32_t N;
++    uint32_t W;
++    uint32_t H;
++};
++
+ struct vk_op_conv_transpose_1d_push_constants {
+     uint32_t Cout;
+     uint32_t Cin;
+@@ -5171,6 +5196,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+         IM2COL()
+     }
+ 
++    ggml_vk_create_pipeline(device, device->pipeline_im2col_cf_f32, "im2col_cf_f32", im2col_cf_f32_len, im2col_cf_f32_data, "main", 2, sizeof(vk_op_im2col_cf_push_constants), {256, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_im2col_cf_f32_f16, "im2col_cf_f32_f16", im2col_cf_f32_f16_len, im2col_cf_f32_f16_data, "main", 2, sizeof(vk_op_im2col_cf_push_constants), {256, 1, 1}, {}, 1);
++
++    ggml_vk_create_pipeline(device, device->pipeline_bilinear_gather_f32, "bilinear_gather_f32", bilinear_gather_f32_len, bilinear_gather_f32_data, "main", 3, sizeof(vk_op_bilinear_gather_push_constants), {256, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_bilinear_gather_f16_f32, "bilinear_gather_f16_f32", bilinear_gather_f16_f32_len, bilinear_gather_f16_f32_data, "main", 3, sizeof(vk_op_bilinear_gather_push_constants), {256, 1, 1}, {}, 1);
++
+     ggml_vk_create_pipeline(device, device->pipeline_timestep_embedding_f32, "timestep_embedding_f32", timestep_embedding_f32_len, timestep_embedding_f32_data, "main", 2, sizeof(vk_op_timestep_embedding_push_constants), {256, 1, 1}, {}, 1);
+ 
+     ggml_vk_create_pipeline(device, device->pipeline_conv_transpose_1d_f32, "conv_transpose_1d_f32", conv_transpose_1d_f32_len, conv_transpose_1d_f32_data, "main", 3, sizeof(vk_op_conv_transpose_1d_push_constants), {1, 1, 1}, {}, 1);
+@@ -10627,6 +10658,16 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const
+         }
+         return nullptr;
+     case GGML_OP_IM2COL:
++        if (((const int32_t *) dst->op_params)[6] & 2) {
++            // channels-first source variant (op_params[6] bit1)
++            if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
++                return ctx->device->pipeline_im2col_cf_f32;
++            }
++            if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16) {
++                return ctx->device->pipeline_im2col_cf_f32_f16;
++            }
++            return nullptr;
++        }
+         if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+             return ctx->device->pipeline_im2col_f32;
+         }
+@@ -10642,6 +10683,16 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const
+             return ctx->device->pipeline_im2col_3d_f32_f16;
+         }
+         return nullptr;
++    case GGML_OP_BILINEAR_GATHER:
++        if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
++            if (src0->type == GGML_TYPE_F32) {
++                return ctx->device->pipeline_bilinear_gather_f32;
++            }
++            if (src0->type == GGML_TYPE_F16) {
++                return ctx->device->pipeline_bilinear_gather_f16_f32;
++            }
++        }
++        return nullptr;
+     case GGML_OP_TIMESTEP_EMBEDDING:
+         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+             return ctx->device->pipeline_timestep_embedding_f32;
+@@ -11030,6 +11081,12 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
+         break;
+     case GGML_OP_IM2COL:
+         {
++            if (dst->op_params[6] & 2) {
++                // channels-first: one 256-thread workgroup per output pixel,
++                // x-threads loop over R = IC*KW*KH (wg_denoms {256,1,1})
++                elements = { 256, (uint32_t)dst->ne[1], (uint32_t)dst->ne[2] };
++                break;
++            }
+             const bool is_2D = dst->op_params[6] == 1;
+ 
+             const uint32_t IC = src1->ne[is_2D ? 2 : 1];
+@@ -11072,6 +11129,9 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
+             elements = { IC_KD_KH_KW, OW, N_OD_OH };
+             elements[2] = std::min(elements[2], ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
+         } break;
++    case GGML_OP_BILINEAR_GATHER:
++        elements = { (uint32_t)ggml_nelements(dst), 1, 1 };
++        break;
+     case GGML_OP_TIMESTEP_EMBEDDING:
+         {
+             const uint32_t dim = dst->op_params[0];
+@@ -11226,8 +11286,10 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
+         vk_subbuffer subbuf3 = use_src3 ? src3_buf : src0_buf;
+         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, subbuf2, dst_buf, subbuf3 }, pc, elements);
+     } else if (op == GGML_OP_IM2COL || op == GGML_OP_IM2COL_3D) {
+-        if (ctx->device->shader_int64 && ctx->device->buffer_device_address) {
++        const bool im2col_cf = op == GGML_OP_IM2COL && (dst->op_params[6] & 2);
++        if (!im2col_cf && ctx->device->shader_int64 && ctx->device->buffer_device_address) {
+             // buffer device address path doesn't use dst buffer
++            // (the cf shader always writes dst through its descriptor)
+             dst_buf.size = 1;
+         }
+         // im2col uses only src1 and dst buffers
+@@ -12723,6 +12785,23 @@ static void ggml_vk_im2col(ggml_backend_vk_context * ctx, vk_context& subctx, co
+     const int32_t d0 = dst->op_params[4];
+     const int32_t d1 = dst->op_params[5];
+ 
++    if (dst->op_params[6] & 2) {
++        // channels-first source [IC, IW, IH, 1]; rows ic-fastest
++        GGML_ASSERT(src1->ne[3] == 1);
++        const uint32_t IC = (uint32_t)src1->ne[0];
++        const uint32_t IW = (uint32_t)src1->ne[1];
++        const uint32_t IH = (uint32_t)src1->ne[2];
++        const uint32_t OW = (uint32_t)dst->ne[1];
++        const uint32_t OH = (uint32_t)dst->ne[2];
++        const uint32_t KW = (uint32_t)src0->ne[0];
++        const uint32_t KH = (uint32_t)src0->ne[1];
++        ggml_vk_op_f32<vk_op_im2col_cf_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_IM2COL, {
++            IC, IW, IH, OW, OH, KW, IC * KW * KH,
++            s0, s1, p0, p1, d0, d1
++        });
++        return;
++    }
++
+     const bool is_2D = dst->op_params[6] == 1;
+ 
+     const uint32_t IC = src1->ne[is_2D ? 2 : 1];
+@@ -12755,6 +12834,14 @@ static void ggml_vk_im2col(ggml_backend_vk_context * ctx, vk_context& subctx, co
+     });
+ }
+ 
++static void ggml_vk_bilinear_gather(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++    const uint32_t W = (uint32_t)((const int32_t *) dst->op_params)[0];
++    const uint32_t H = (uint32_t)((const int32_t *) dst->op_params)[1];
++    ggml_vk_op_f32<vk_op_bilinear_gather_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_BILINEAR_GATHER, {
++        (uint32_t)src0->ne[0], (uint32_t)src1->ne[1], W, H
++    });
++}
++
+ static void ggml_vk_im2col_3d(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     GGML_TENSOR_BINARY_OP_LOCALS
+ 
+@@ -14344,6 +14431,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+     case GGML_OP_IM2COL_3D:
+         ggml_vk_im2col_3d(ctx, compute_ctx, src0, src1, node);
+ 
++        break;
++    case GGML_OP_BILINEAR_GATHER:
++        ggml_vk_bilinear_gather(ctx, compute_ctx, src0, src1, node);
++
+         break;
+     case GGML_OP_TIMESTEP_EMBEDDING:
+         ggml_vk_timestep_embedding(ctx, compute_ctx, src0, node);
+@@ -17041,6 +17132,12 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+         case GGML_OP_IM2COL_3D:
+             return op->src[1]->type == GGML_TYPE_F32
+                 && (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16);
++        case GGML_OP_BILINEAR_GATHER:
++            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16)
++                && op->src[1]->type == GGML_TYPE_F32
++                && op->type == GGML_TYPE_F32
++                && ggml_is_contiguous(op->src[0])
++                && ggml_is_contiguous(op->src[1]);
+         case GGML_OP_TIMESTEP_EMBEDDING:
+             return op->src[0]->type == GGML_TYPE_F32;
+         case GGML_OP_CONV_2D_DW:
+@@ -17910,8 +18007,15 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
+             const int32_t d0 = tensor->op_params[4];
+             const int32_t d1 = tensor->op_params[5];
+ 
+-            const bool is_2D = tensor->op_params[6] == 1;
+-            tensor_clone = ggml_im2col(ggml_ctx, src_clone[0], src_clone[1], s0, s1, p0, p1, d0, d1, is_2D, tensor->type);
++            if (tensor->op_params[6] & 2) {
++                tensor_clone = ggml_im2col_cf(ggml_ctx, src_clone[0], src_clone[1], s0, s1, p0, p1, d0, d1, tensor->type);
++            } else {
++                const bool is_2D = tensor->op_params[6] == 1;
++                tensor_clone = ggml_im2col(ggml_ctx, src_clone[0], src_clone[1], s0, s1, p0, p1, d0, d1, is_2D, tensor->type);
++            }
++        } else if (tensor->op == GGML_OP_BILINEAR_GATHER) {
++            tensor_clone = ggml_bilinear_gather(ggml_ctx, src_clone[0], src_clone[1],
++                                                tensor->op_params[0], tensor->op_params[1]);
+         } else if (tensor->op == GGML_OP_IM2COL_3D) {
+             const int32_t s0 = tensor->op_params[0];
+             const int32_t s1 = tensor->op_params[1];
+diff --git a/src/ggml-vulkan/vulkan-shaders/bilinear_gather.comp b/src/ggml-vulkan/vulkan-shaders/bilinear_gather.comp
+new file mode 100644
+index 00000000..8a788fab
+--- /dev/null
++++ b/src/ggml-vulkan/vulkan-shaders/bilinear_gather.comp
+@@ -0,0 +1,55 @@
++#version 450
++// fused bilinear sampling gather (torch grid_sample: bilinear, zeros
++// padding, align_corners=false) over a channels-first flattened map.
++//   binding 0: feat [C, W*H] (A_TYPE f32/f16)
++//   binding 1: grid [2, N] f32 normalized (x, y)
++//   binding 2: dst  [C, N] f32
++
++#include "types.glsl"
++
++#extension GL_EXT_control_flow_attributes : enable
++
++layout (push_constant) uniform parameter
++{
++    uint C;
++    uint N;
++    uint W;
++    uint H;
++} p;
++
++layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
++
++layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
++layout (binding = 1) readonly buffer B {B_TYPE data_b[];};
++layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
++
++void main() {
++    const uint i = gl_GlobalInvocationID.x;
++    if (i >= p.C * p.N) {
++        return;
++    }
++    const uint c = i % p.C;
++    const uint n = i / p.C;
++
++    const float gx = float(data_b[2*n + 0]);
++    const float gy = float(data_b[2*n + 1]);
++    const float fx = (gx + 1.0f) * 0.5f * float(p.W) - 0.5f;
++    const float fy = (gy + 1.0f) * 0.5f * float(p.H) - 0.5f;
++    const int x0 = int(floor(fx));
++    const int y0 = int(floor(fy));
++    const float wx = fx - float(x0);
++    const float wy = fy - float(y0);
++
++    float acc = 0.0f;
++    [[unroll]] for (int k = 0; k < 4; k++) {
++        const int cx = x0 + (k & 1);
++        const int cy = y0 + (k >> 1);
++        if (cx < 0 || cx >= int(p.W) || cy < 0 || cy >= int(p.H)) {
++            continue;
++        }
++        const float wgt = (((k & 1) != 0) ? wx : (1.0f - wx)) *
++                          (((k >> 1) != 0) ? wy : (1.0f - wy));
++        acc += wgt * float(data_a[(uint(cy) * p.W + uint(cx)) * p.C + c]);
++    }
++    data_d[i] = D_TYPE(acc);
++}
+diff --git a/src/ggml-vulkan/vulkan-shaders/im2col_cf.comp b/src/ggml-vulkan/vulkan-shaders/im2col_cf.comp
+new file mode 100644
+index 00000000..acc40568
+--- /dev/null
++++ b/src/ggml-vulkan/vulkan-shaders/im2col_cf.comp
+@@ -0,0 +1,53 @@
++#version 450
++// channels-first im2col: src [IC, IW, IH, 1] contiguous, dst rows are
++// ic-fastest: r = ic + IC*(kw + KW*kh). One workgroup slice per output
++// pixel (y = ow, z = oh), x-threads loop over R = IC*KW*KH.
++//   binding 0: src  [IC, IW, IH] f32 (the op's src1)
++//   binding 1: dst  [R, OW, OH]  (D_TYPE f32/f16)
++
++#include "types.glsl"
++
++layout (push_constant) uniform parameter
++{
++    uint IC;
++    uint IW;
++    uint IH;
++    uint OW;
++    uint OH;
++    uint KW;
++    uint R;   // IC*KW*KH
++    int  s0;
++    int  s1;
++    int  p0;
++    int  p1;
++    int  d0;
++    int  d1;
++} p;
++
++layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
++
++layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
++layout (binding = 1) writeonly buffer D {D_TYPE data_d[];};
++
++void main() {
++    const uint ow = gl_GlobalInvocationID.y;
++    const uint oh = gl_GlobalInvocationID.z;
++    if (ow >= p.OW || oh >= p.OH) {
++        return;
++    }
++    const uint base = (oh * p.OW + ow) * p.R;
++    const uint stride = gl_WorkGroupSize.x * gl_NumWorkGroups.x;
++    for (uint r = gl_GlobalInvocationID.x; r < p.R; r += stride) {
++        const uint ic = r % p.IC;
++        const uint k  = r / p.IC;
++        const uint kw = k % p.KW;
++        const uint kh = k / p.KW;
++        const int iw = int(ow) * p.s0 + int(kw) * p.d0 - p.p0;
++        const int ih = int(oh) * p.s1 + int(kh) * p.d1 - p.p1;
++        float v = 0.0f;
++        if (iw >= 0 && iw < int(p.IW) && ih >= 0 && ih < int(p.IH)) {
++            v = float(data_a[(uint(ih) * p.IW + uint(iw)) * p.IC + ic]);
++        }
++        data_d[base + r] = D_TYPE(v);
++    }
++}
+diff --git a/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index 7bcb1460..2046ec9c 100644
+--- a/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -997,6 +997,12 @@ void process_shaders() {
+         }
+     }
+ 
++    string_to_spv("im2col_cf_f32", "im2col_cf.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
++    string_to_spv("im2col_cf_f32_f16", "im2col_cf.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float16_t"}}));
++
++    string_to_spv("bilinear_gather_f32", "bilinear_gather.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
++    string_to_spv("bilinear_gather_f16_f32", "bilinear_gather.comp", merge_maps(base_dict, {{"A_TYPE", "float16_t"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
++
+     string_to_spv("timestep_embedding_f32", "timestep_embedding.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+ 
+     string_to_spv("conv_transpose_1d_f32", "conv_transpose_1d.comp", {{"A_TYPE", "float"},  {"B_TYPE", "float"}, {"D_TYPE", "float"}});
 diff --git a/src/ggml.c b/src/ggml.c
 index b43016c8..67059eb9 100644
 --- a/src/ggml.c

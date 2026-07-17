@@ -19,6 +19,10 @@ static double now_ms() { return (double) ggml_time_us() / 1000.0; }
 
 int main(int argc, char **argv) {
     std::string gguf, ref_root, device = "gpu", ftype = "f32", json_out;
+    // --rows csv over {menc,aud,fmt,ode,mdec,pipe2,pipe10}: skip the others
+    // (lets slow fallback configs measure a subset without waiting on the
+    // multi-minute pipeline rows). Default: everything.
+    std::string rows_sel = "menc,aud,fmt,ode,mdec,pipe2,pipe10";
     int iters = 10;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -29,11 +33,15 @@ int main(int argc, char **argv) {
         else if (a == "--ftype") ftype = next();
         else if (a == "--json") json_out = next();
         else if (a == "--iters") iters = atoi(next());
+        else if (a == "--rows") rows_sel = next();
         else {
             fprintf(stderr, "unknown arg %s\n", a.c_str());
             return 2;
         }
     }
+    auto want = [&](const char *k) {
+        return rows_sel.find(k) != std::string::npos;
+    };
     if (gguf.empty() || ref_root.empty()) {
         fprintf(stderr, "usage: tp-bench --gguf DIR --ref DUMPS [--json OUT]\n");
         return 2;
@@ -57,7 +65,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "menc: %s\n", c->err.c_str());
         return 1;
     }
-    {
+    if (want("menc")) {
         double t0 = now_ms();
         for (int i = 0; i < iters; i++)
             c->menc.run(c->be, fx.image.data(), m, no_tap, c->err);
@@ -67,7 +75,7 @@ int main(int argc, char **argv) {
     }
 
     // audio enc per 10 s (160000 samples, 250 frames)
-    {
+    if (want("aud")) {
         std::vector<float> a10((size_t) 160000);
         for (size_t i = 0; i < a10.size(); i++) a10[i] = fx.audio[i % fx.audio.size()];
         std::vector<float> wa;
@@ -83,18 +91,20 @@ int main(int argc, char **argv) {
     }
 
     // FMT forward + ODE chunk
-    {
+    if (want("fmt") || want("ode")) {
         std::vector<float> wa;
         c->audio.encode(c->be, fx.audio.data(), fx.n_samples, fx.n_frames, wa, no_tap, c->err);
         std::vector<float> x60((size_t) 60 * 512, 0.0f), cond((size_t) 3 * 60 * 1031, 0.0f);
         std::vector<float> v((size_t) 3 * 60 * 512);
         c->fmt.forward(c->be, x60.data(), cond.data(), 0.0f, v.data(), no_tap, c->err);
-        double t0 = now_ms();
-        for (int i = 0; i < iters; i++)
-            c->fmt.forward(c->be, x60.data(), cond.data(), 0.5f, v.data(), no_tap, c->err);
-        double ms = (now_ms() - t0) / iters;
-        snprintf(buf, sizeof buf, "%.2f ms", ms);
-        rows.push_back({"FMT fwd (CFG batch 3)", buf, ""});
+        if (want("fmt")) {
+            double t0 = now_ms();
+            for (int i = 0; i < iters; i++)
+                c->fmt.forward(c->be, x60.data(), cond.data(), 0.5f, v.data(), no_tap, c->err);
+            double ms = (now_ms() - t0) / iters;
+            snprintf(buf, sizeof buf, "%.2f ms", ms);
+            rows.push_back({"FMT fwd (CFG batch 3)", buf, ""});
+        }
 
         std::vector<float> mo((size_t) 50 * 512);
         std::vector<float> zeros((size_t) 10 * 512, 0.0f);
@@ -106,19 +116,21 @@ int main(int argc, char **argv) {
         io.wr = m.motion.data();
         io.emotion = fx.emotion;
         io.motion_out = mo.data();
-        sample_chunk_ex(c, io, nullptr, "", nullptr, -1, "", c->err);  // warmup
-        t0 = now_ms();
-        for (int i = 0; i < iters; i++)
-            sample_chunk_ex(c, io, nullptr, "", nullptr, -1, "", c->err);
-        ms = (now_ms() - t0) / iters;
-        snprintf(buf, sizeof buf, "%.1f ms", ms);
-        char rate[64];
-        snprintf(rate, sizeof rate, "%.2f ms/step", ms / 9.0);
-        rows.push_back({"ODE chunk (9 steps, 50 fr)", buf, rate});
+        if (want("ode")) {
+            sample_chunk_ex(c, io, nullptr, "", nullptr, -1, "", c->err);  // warmup
+            double t1 = now_ms();
+            for (int i = 0; i < iters; i++)
+                sample_chunk_ex(c, io, nullptr, "", nullptr, -1, "", c->err);
+            double ms1 = (now_ms() - t1) / iters;
+            snprintf(buf, sizeof buf, "%.1f ms", ms1);
+            char rate[64];
+            snprintf(rate, sizeof rate, "%.2f ms/step", ms1 / 9.0);
+            rows.push_back({"ODE chunk (9 steps, 50 fr)", buf, rate});
+        }
     }
 
     // mdec per frame
-    {
+    if (want("mdec")) {
         if (!c->mdec.built || c->mdec.taps_in_graph) c->mdec.build(c->be, false, c->err);
         c->mdec.set_feats(m, c->err);
         std::vector<float> style(512), img((size_t) 3 * 512 * 512);
@@ -138,6 +150,7 @@ int main(int argc, char **argv) {
 
     // pipeline 2 s and 10 s
     for (double secs : {2.0, 10.0}) {
+        if (!(secs == 2.0 ? want("pipe2") : want("pipe10"))) continue;
         const int64_t n = (int64_t) (secs * 16000);
         std::vector<float> audio((size_t) n);
         for (int64_t i = 0; i < n; i++) audio[(size_t) i] = fx.audio[(size_t) (i % fx.audio.size())];

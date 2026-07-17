@@ -14,3 +14,6 @@ parity-dumps-cuda/
 videos-vulkan/
 build-vulkan.log
 parity-vulkan-run.log
+bench-vk-*.json
+bench-vulkan-runs.log
+build-vulkan-stretch.log

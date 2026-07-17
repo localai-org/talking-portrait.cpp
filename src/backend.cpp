@@ -77,13 +77,21 @@ void plan_t::begin(size_t max_nodes) {
 
 // the ggml_im2col_cf fast path is encoded as GGML_OP_IM2COL with a
 // channels-first flag in op_params[6] (bit 1). Backends without a cf kernel
-// (everything except CPU and the patched CUDA) still claim IM2COL support
-// and would silently compute the channels-last layout — treat the node as
-// unsupported there so the scheduler routes it to the CPU.
+// (everything except CPU, the patched CUDA and the patched Vulkan) still
+// claim IM2COL support and would silently compute the channels-last layout —
+// treat the node as unsupported there so the scheduler routes it to the CPU.
 static bool node_runs_natively(ggml_backend_t be, const ggml_tensor *n) {
-    if (n->op == GGML_OP_IM2COL && (((const int32_t *) n->op_params)[6] & 2)) {
+    const bool cf_im2col =
+        n->op == GGML_OP_IM2COL && (((const int32_t *) n->op_params)[6] & 2);
+    if (cf_im2col || n->op == GGML_OP_BILINEAR_GATHER) {
+        // measurement knob: force the custom ops onto the CPU fallback even
+        // on backends that have kernels for them (baseline reproduction)
+        if (getenv("TP_FORCE_FALLBACK")) return false;
+    }
+    if (cf_im2col) {
         const char *bn = ggml_backend_name(be);
-        if (strncmp(bn, "CPU", 3) != 0 && strncmp(bn, "CUDA", 4) != 0) return false;
+        if (strncmp(bn, "CPU", 3) != 0 && strncmp(bn, "CUDA", 4) != 0 &&
+            strncmp(bn, "Vulkan", 6) != 0) return false;
     }
     return ggml_backend_supports_op(be, n);
 }

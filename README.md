@@ -53,11 +53,15 @@ submodule checkout) adds two things needed for the M7 performance bar:
 
 - `GGML_OP_BILINEAR_GATHER` (`ggml_bilinear_gather`): fused torch-style
   `grid_sample` (bilinear, zeros padding, `align_corners=false`) over a
-  channels-first flattened feature map. CPU + CUDA. Replaces ~30 ops and 4
+  channels-first flattened feature map. CPU + CUDA + Vulkan. Replaces ~30 ops and 4
   `get_rows` per decoder stage.
 - `ggml_im2col_cf`: im2col reading a channels-first `[C,W,H]` source with
   ic-fastest output rows, plus a block-per-pixel int32 CUDA kernel (the
-  stock kernel's int64 index math dominated decode time).
+  stock kernel's int64 index math dominated decode time) and a Vulkan
+  workgroup-per-pixel shader.
+
+Vulkan build + measurements: see `docs/vulkan-perf.md` (preset `vulkan`,
+`bench-vulkan.json`).
 
 ## Numerics
 
