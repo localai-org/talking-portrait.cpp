@@ -147,7 +147,10 @@ bool weights_t::load(const std::string &path, backend_t &be, const char *expect_
         // tensors (biases, blur kernels) dequantize to f32 so elementwise
         // ops stay single-type
         const bool big = t.n >= 4096;
-        const ggml_type tt = (keep_f16 && t.gtype == 1 && big) ? GGML_TYPE_F16 : GGML_TYPE_F32;
+        const bool excluded = !f16_exclude_prefix.empty() &&
+                              t.name.rfind(f16_exclude_prefix, 0) == 0;
+        const ggml_type tt =
+            (keep_f16 && t.gtype == 1 && big && !excluded) ? GGML_TYPE_F16 : GGML_TYPE_F32;
         ggml_tensor *d = ggml_new_tensor(ctx, tt, GGML_MAX_DIMS, t.ne);
         ggml_set_name(d, t.name.c_str());
         map[t.name] = d;

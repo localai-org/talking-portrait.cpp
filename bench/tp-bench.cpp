@@ -166,7 +166,13 @@ int main(int argc, char **argv) {
         js += "  [\"" + rows[i][0] + "\", \"" + rows[i][1] + "\", \"" + rows[i][2] + "\"]";
         js += i + 1 < rows.size() ? ",\n" : "\n";
     }
-    js += " ],\n \"peak_vram_mb\": 0\n}\n";
+    size_t vfree = 0, vtotal = 0;
+    if (ggml_backend_dev_t dev = ggml_backend_get_device(c->be.be))
+        ggml_backend_dev_memory(dev, &vfree, &vtotal);
+    char vb[64];
+    snprintf(vb, sizeof vb, " ],\n \"peak_vram_mb\": %zu\n}\n",
+             vtotal && vfree ? (vtotal - vfree) >> 20 : 0);
+    js += vb;
     if (!json_out.empty()) {
         if (!write_file(json_out, js.data(), js.size(), err)) {
             fprintf(stderr, "%s\n", err.c_str());

@@ -42,6 +42,7 @@ struct weights_t {
     std::map<std::string, double> kv_num;
     bool keep_f16 = false;  // keep file-f16 tensors as F16 (fast path);
                             // default dequantizes everything to F32
+    std::string f16_exclude_prefix;  // names with this prefix stay F32
 
     // scale_for(name, ne): multiplier folded into the tensor at load
     // (Equal* runtime scales); ne is ggml order (ne0 = torch last dim)

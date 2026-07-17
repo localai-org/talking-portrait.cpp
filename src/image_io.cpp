@@ -30,6 +30,13 @@ extern "C" float *tp_load_image(const void *data, size_t size, char *err,
         return nullptr;
     }
     int w = 0, h = 0, comp = 0;
+    // header-only pre-check: reject oversized images BEFORE decoding
+    if (!stbi_info_from_memory((const stbi_uc *) data, (int) size, &w, &h, &comp) ||
+        w < 8 || h < 8 || w > (1 << 13) || h > (1 << 13) ||
+        (int64_t) w * h > (int64_t) 1 << 24) {
+        set_err(err, err_size, "image missing/oversized/undersized");
+        return nullptr;
+    }
     unsigned char *rgb = stbi_load_from_memory((const stbi_uc *) data, (int) size,
                                                &w, &h, &comp, 3);
     if (!rgb) {
