@@ -32,6 +32,15 @@
       }
     },
     {
+      "name": "vulkan",
+      "binaryDir": "${sourceDir}/build/vulkan",
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "TP_VULKAN": "ON"
+      }
+    },
+    {
       "name": "fuzz",
       "binaryDir": "${sourceDir}/build/fuzz",
       "generator": "Ninja",
@@ -55,6 +64,10 @@
     {
       "name": "cuda",
       "configurePreset": "cuda"
+    },
+    {
+      "name": "vulkan",
+      "configurePreset": "vulkan"
     },
     {
       "name": "fuzz",

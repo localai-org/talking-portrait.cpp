@@ -526,7 +526,12 @@ bool motion_dec::build(backend_t &be, bool with_taps, std::string &err) {
         if (max_stage < 1 || max_stage > 7) max_stage = 7;
     }
 
-    if (with_taps) {
+    // TP_MDEC_EXACT=1 forces the conservative graph for generation too:
+    // measurement knob for backends where the fast graph's custom ops fall
+    // back to the CPU (e.g. Vulkan). Taps stay tied to with_taps.
+    const bool exact_graph = with_taps || getenv("TP_MDEC_EXACT") != nullptr;
+
+    if (exact_graph) {
         // ---- numerically-conservative parity graph (spatial, direct convs,
         // map-side modulation): per-frame cost does not matter here, tap
         // fidelity does. The fast channel-last graph below is used for

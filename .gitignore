@@ -8,3 +8,9 @@ compile_commands.json
 fuzz-out/
 videos-f16/
 parity-dumps-f16/
+parity-dumps-vulkan/
+parity-dumps-vulkan-f16/
+parity-dumps-cuda/
+videos-vulkan/
+build-vulkan.log
+parity-vulkan-run.log

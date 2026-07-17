@@ -21,6 +21,10 @@ namespace tp {
 // ---------------- backend ----------------
 struct backend_t {
     ggml_backend_t be = nullptr;
+    // CPU fallback backend for GPU backends that lack kernels for some ops
+    // (e.g. the Vulkan backend has no BILINEAR_GATHER / cf-im2col kernels);
+    // created alongside GPU backends, used only by plans that need it.
+    ggml_backend_t cpu_fb = nullptr;
     bool gpu = false;
     int n_threads = 0;
 
@@ -74,6 +78,9 @@ struct plan_t {
     ggml_context *ctx = nullptr;
     ggml_cgraph *gf = nullptr;
     ggml_gallocr_t galloc = nullptr;
+    // set instead of galloc when the primary backend cannot run every node:
+    // ggml scheduler with {gpu, cpu} and per-op CPU fallback (Vulkan path)
+    ggml_backend_sched_t sched = nullptr;
     size_t graph_size = 0;
 
     void begin(size_t max_nodes);

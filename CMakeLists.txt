@@ -11,6 +11,7 @@ if (NOT CMAKE_BUILD_TYPE)
 endif()
 
 option(TP_CUDA        "enable the CUDA backend (via GGML_CUDA)" OFF)
+option(TP_VULKAN      "enable the Vulkan backend (via GGML_VULKAN)" OFF)
 option(TP_FUZZ        "build libFuzzer targets (clang only)"    OFF)
 option(TP_BUILD_TOOLS "build CLI / parity / bench tools"        ON)
 option(TP_BUILD_TESTS "build ctest suite"                       ON)
@@ -20,6 +21,10 @@ if (TP_CUDA)
     if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
         set(CMAKE_CUDA_ARCHITECTURES 120)
     endif()
+endif()
+
+if (TP_VULKAN)
+    set(GGML_VULKAN ON CACHE BOOL "" FORCE)
 endif()
 
 if (TP_FUZZ)
