@@ -23,7 +23,7 @@ fail=0
         cov=$(grep -E '^#[0-9]+' "$log" | tail -1 | grep -oE 'cov: [0-9]+' | grep -oE '[0-9]+' || echo "?")
         exitc=$(grep -E '^EXIT=' "$log" | tail -1 | cut -d= -f2 | cut -d' ' -f1)
         # wall time: from -max_total_time (wav/json/cliargs 3700 s, image 7300 s)
-        case $t in image) wall=3500;; *) wall=3700;; esac
+        case $t in image|json) wall=3500;; *) wall=3700;; esac
         total_secs=$((total_secs + wall))
         crashes=$(grep -cE 'ERROR: (Address|LeakSanitizer|libFuzzer: deadly)|UndefinedBehaviorSanitizer|runtime error' "$log" || true)
         echo "target fuzz_$t: wall ${wall}s, executions ${execs}, corpus ${corp} units, cov ${cov} edges, exit ${exitc}, sanitizer errors ${crashes}"
@@ -39,6 +39,9 @@ fail=0
     echo "    -> guarded (vendored stb patched, marked /* tp: */)"
     echo " 3. image: UBSan misaligned 8-byte store in stb_image_resize2"
     echo "    STBIR_MOVE_* -> memcpy-based moves (vendored stb patched)"
+    echo " 4. json: UBSan out-of-range double->int casts in meta.json consumers"
+    echo "    (n_frames, tap shapes) and the writer fast path -> json_i64 bounded"
+    echo "    conversion + shape dim/product caps"
     echo "additional informational runs: pre-UB-fix image runs of ~60 min each"
     echo " (371k execs) with no ASan/leak findings beyond the UBSan reports above"
     echo
