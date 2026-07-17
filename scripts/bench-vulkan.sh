@@ -17,8 +17,9 @@ nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -lms 200 > "$VR
 SMI=$!
 trap 'kill $SMI 2>/dev/null || true' EXIT
 
+# TP_BENCH_ARGS: extra tp-bench arguments (e.g. "--rows mdec,pipe2")
 env "$@" ./build/vulkan/tp-bench --gguf "$HARNESS/ggufs" --ref "$HARNESS/dumps" \
-    --device gpu --ftype "$FTYPE" --json "bench-vk-$TAG.json" </dev/null
+    --device gpu --ftype "$FTYPE" --json "bench-vk-$TAG.json" ${TP_BENCH_ARGS:-} </dev/null
 
 kill $SMI 2>/dev/null || true; wait $SMI 2>/dev/null || true
 PEAK=$(sort -n "$VRAMLOG" | tail -1)

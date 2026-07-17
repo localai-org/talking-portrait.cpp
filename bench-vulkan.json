@@ -1,0 +1,310 @@
+{
+ "label": "cpp-f16-vulkan",
+ "rows": [
+  [
+   "menc (per portrait)",
+   "18.2 ms",
+   ""
+  ],
+  [
+   "audio enc (per 10 s)",
+   "12.1 ms",
+   "827 s-audio/s"
+  ],
+  [
+   "FMT fwd (CFG batch 3)",
+   "2.35 ms",
+   ""
+  ],
+  [
+   "ODE chunk (9 steps, 50 fr)",
+   "21.3 ms",
+   "2.36 ms/step"
+  ],
+  [
+   "mdec (per frame)",
+   "5.17 ms",
+   "193.4 fps"
+  ],
+  [
+   "pipeline 2 s video",
+   "357 ms",
+   "RTF 5.60, 140.0 fps"
+  ],
+  [
+   "pipeline 10 s video",
+   "1515 ms",
+   "RTF 6.60, 165.0 fps"
+  ]
+ ],
+ "peak_vram_mb": 2572,
+ "peak_vram_sampled_mb": 2110,
+ "configs": [
+  {
+   "label": "cpp-vulkan-fast-f16-gpu",
+   "rows": [
+    [
+     "menc (per portrait)",
+     "18.2 ms",
+     ""
+    ],
+    [
+     "audio enc (per 10 s)",
+     "12.1 ms",
+     "827 s-audio/s"
+    ],
+    [
+     "FMT fwd (CFG batch 3)",
+     "2.35 ms",
+     ""
+    ],
+    [
+     "ODE chunk (9 steps, 50 fr)",
+     "21.3 ms",
+     "2.36 ms/step"
+    ],
+    [
+     "mdec (per frame)",
+     "5.17 ms",
+     "193.4 fps"
+    ],
+    [
+     "pipeline 2 s video",
+     "357 ms",
+     "RTF 5.60, 140.0 fps"
+    ],
+    [
+     "pipeline 10 s video",
+     "1515 ms",
+     "RTF 6.60, 165.0 fps"
+    ]
+   ],
+   "peak_vram_mb": 2572,
+   "config": "fast graph, custom ops on Vulkan, default shader math",
+   "peak_vram_sampled_mb": 2110
+  },
+  {
+   "label": "cpp-vulkan-fast-f32-gpu",
+   "rows": [
+    [
+     "menc (per portrait)",
+     "18.0 ms",
+     ""
+    ],
+    [
+     "audio enc (per 10 s)",
+     "12.4 ms",
+     "807 s-audio/s"
+    ],
+    [
+     "FMT fwd (CFG batch 3)",
+     "2.83 ms",
+     ""
+    ],
+    [
+     "ODE chunk (9 steps, 50 fr)",
+     "25.8 ms",
+     "2.86 ms/step"
+    ],
+    [
+     "mdec (per frame)",
+     "7.00 ms",
+     "143.0 fps"
+    ],
+    [
+     "pipeline 2 s video",
+     "422 ms",
+     "RTF 4.74, 118.6 fps"
+    ],
+    [
+     "pipeline 10 s video",
+     "1952 ms",
+     "RTF 5.12, 128.1 fps"
+    ]
+   ],
+   "peak_vram_mb": 3068,
+   "config": "fast graph f32, custom ops on Vulkan, default shader math",
+   "peak_vram_sampled_mb": 2606
+  },
+  {
+   "label": "cpp-vulkan-exact-f16-gpu",
+   "rows": [
+    [
+     "menc (per portrait)",
+     "17.9 ms",
+     ""
+    ],
+    [
+     "audio enc (per 10 s)",
+     "12.0 ms",
+     "830 s-audio/s"
+    ],
+    [
+     "FMT fwd (CFG batch 3)",
+     "2.35 ms",
+     ""
+    ],
+    [
+     "ODE chunk (9 steps, 50 fr)",
+     "21.4 ms",
+     "2.38 ms/step"
+    ],
+    [
+     "mdec (per frame)",
+     "6.56 ms",
+     "152.6 fps"
+    ],
+    [
+     "pipeline 2 s video",
+     "427 ms",
+     "RTF 4.68, 117.0 fps"
+    ],
+    [
+     "pipeline 10 s video",
+     "1869 ms",
+     "RTF 5.35, 133.8 fps"
+    ]
+   ],
+   "peak_vram_mb": 2526,
+   "config": "conservative graph (TP_MDEC_EXACT=1), custom ops on Vulkan, default math",
+   "peak_vram_sampled_mb": 2285
+  },
+  {
+   "label": "cpp-vulkan-fast-f16-fallback",
+   "rows": [
+    [
+     "mdec (per frame)",
+     "2844.54 ms",
+     "0.4 fps"
+    ],
+    [
+     "pipeline 2 s video",
+     "147893 ms",
+     "RTF 0.01, 0.3 fps"
+    ]
+   ],
+   "peak_vram_mb": 2291,
+   "config": "BASELINE fast graph, custom ops on CPU (TP_FORCE_FALLBACK=1); mdec+pipe2 rows only",
+   "peak_vram_sampled_mb": 1848
+  },
+  {
+   "label": "cpp-vulkan-fast-f16-strict",
+   "rows": [
+    [
+     "menc (per portrait)",
+     "36.0 ms",
+     ""
+    ],
+    [
+     "audio enc (per 10 s)",
+     "22.5 ms",
+     "444 s-audio/s"
+    ],
+    [
+     "FMT fwd (CFG batch 3)",
+     "5.67 ms",
+     ""
+    ],
+    [
+     "ODE chunk (9 steps, 50 fr)",
+     "51.4 ms",
+     "5.71 ms/step"
+    ],
+    [
+     "mdec (per frame)",
+     "9.05 ms",
+     "110.5 fps"
+    ]
+   ],
+   "peak_vram_mb": 2410,
+   "config": "fast graph, scalar-f32 shader math (GGML_VK_DISABLE_F16/COOPMAT/COOPMAT2); no pipeline rows",
+   "peak_vram_sampled_mb": 1948
+  },
+  {
+   "label": "cpp-vulkan-exact-f16",
+   "rows": [
+    [
+     "menc (per portrait)",
+     "35.2 ms",
+     ""
+    ],
+    [
+     "audio enc (per 10 s)",
+     "12.1 ms",
+     "825 s-audio/s"
+    ],
+    [
+     "FMT fwd (CFG batch 3)",
+     "2.36 ms",
+     ""
+    ],
+    [
+     "ODE chunk (9 steps, 50 fr)",
+     "21.3 ms",
+     "2.37 ms/step"
+    ],
+    [
+     "mdec (per frame)",
+     "1957.00 ms",
+     "0.5 fps"
+    ],
+    [
+     "pipeline 2 s video",
+     "104905 ms",
+     "RTF 0.02, 0.5 fps"
+    ],
+    [
+     "pipeline 10 s video",
+     "508707 ms",
+     "RTF 0.02, 0.5 fps"
+    ]
+   ],
+   "peak_vram_mb": 2325,
+   "config": "BASELINE conservative graph, bilinear_gather on CPU (pre-kernel)",
+   "peak_vram_sampled_mb": 2069
+  },
+  {
+   "label": "cpp-vulkan-exact-f32",
+   "rows": [
+    [
+     "menc (per portrait)",
+     "18.1 ms",
+     ""
+    ],
+    [
+     "audio enc (per 10 s)",
+     "12.0 ms",
+     "830 s-audio/s"
+    ],
+    [
+     "FMT fwd (CFG batch 3)",
+     "2.85 ms",
+     ""
+    ],
+    [
+     "ODE chunk (9 steps, 50 fr)",
+     "25.9 ms",
+     "2.88 ms/step"
+    ],
+    [
+     "mdec (per frame)",
+     "1580.70 ms",
+     "0.6 fps"
+    ],
+    [
+     "pipeline 2 s video",
+     "78259 ms",
+     "RTF 0.03, 0.6 fps"
+    ],
+    [
+     "pipeline 10 s video",
+     "449115 ms",
+     "RTF 0.02, 0.6 fps"
+    ]
+   ],
+   "peak_vram_mb": 2672,
+   "config": "BASELINE conservative graph f32, bilinear_gather on CPU (pre-kernel)",
+   "peak_vram_sampled_mb": 2364
+  }
+ ]
+}
