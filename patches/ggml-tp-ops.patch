@@ -70,7 +70,7 @@ index eb8341c9..42f69250 100644
          case GGML_OP_ARANGE:
          case GGML_OP_TIMESTEP_EMBEDDING:
 diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
-index 74611dce..0fb123fe 100644
+index 74611dce..fac5d763 100644
 --- a/src/ggml-cpu/ops.cpp
 +++ b/src/ggml-cpu/ops.cpp
 @@ -6226,15 +6226,17 @@ static void ggml_compute_forward_im2col_f32(
@@ -140,7 +140,47 @@ index 74611dce..0fb123fe 100644
  
      const int64_t KH = is_2D ? ne01 : 1;
      const int64_t KW = ne00;
-@@ -11485,3 +11494,58 @@ void ggml_compute_forward_fwht(const ggml_compute_params * params, ggml_tensor *
+@@ -6336,25 +6345,32 @@ static void ggml_compute_forward_im2col_f16(
+ 
+                         // micro kernel
+                         ggml_fp16_t * dst_data = wdata + (in*OH*OW + ioh*OW + iow)*(IC*KH*KW); // [IC, KH, KW]
++                        const char * const src_base = cf
++                            ? (const char *) src1->data + in*nb13                  // [IH, IW, IC]
++                            : (const char *) src1->data + in*ofs0 + iic*ofs1;      // [IH, IW]
+                         const float * const src_data_f32 = src1->type == GGML_TYPE_F32
+-                            ? (const float *)((const char *) src1->data + in*ofs0 + iic*ofs1)
+-                            : nullptr; // [IH, IW]
++                            ? (const float *) src_base
++                            : nullptr;
+                         const ggml_fp16_t * const src_data_f16 = src1->type == GGML_TYPE_F16
+-                            ? (const ggml_fp16_t *)((const char *) src1->data + in*ofs0 + iic*ofs1)
+-                            : nullptr; // [IH, IW]
++                            ? (const ggml_fp16_t *) src_base
++                            : nullptr;
+ 
+                         for (int64_t ikh = 0; ikh < KH; ikh++) {  // 1
+                             for (int64_t ikw = 0; ikw < KW; ikw++) {
+                                 const int64_t iiw = iow*s0 + ikw*d0 - p0;
+                                 const int64_t iih = ioh*s1 + ikh*d1 - p1;
+ 
++                                // cf rows are ic-fastest: r = ic + IC*(kw + KW*kh)
++                                const int64_t r = cf ? (iic + IC*(ikw + KW*ikh))
++                                                     : (iic*(KH*KW) + ikh*KW + ikw);
+                                 if (iih < 0 || iih >= IH || iiw < 0 || iiw >= IW) {
+-                                    dst_data[iic*(KH*KW) + ikh*KW + ikw] = 0;
++                                    dst_data[r] = 0;
+                                 } else {
++                                    const int64_t s = cf ? (iic + IC*(iiw + IW*iih)) : (iih*IW + iiw);
+                                     if (src_data_f32 != nullptr) {
+-                                        dst_data[iic*(KH*KW) + ikh*KW + ikw] = GGML_CPU_FP32_TO_FP16(src_data_f32[iih*IW + iiw]);
++                                        dst_data[r] = GGML_CPU_FP32_TO_FP16(src_data_f32[s]);
+                                     } else {
+-                                        dst_data[iic*(KH*KW) + ikh*KW + ikw] = src_data_f16[iih*IW + iiw];
++                                        dst_data[r] = src_data_f16[s];
+                                     }
+                                 }
+                             }
+@@ -11485,3 +11501,58 @@ void ggml_compute_forward_fwht(const ggml_compute_params * params, ggml_tensor *
              }
      }
  }
