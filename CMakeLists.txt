@@ -33,6 +33,22 @@ if (TP_FUZZ)
     add_link_options(-fsanitize=${TP_FUZZ_SANITIZERS})
 endif()
 
+# The vendored ggml submodule carries a small local patch (see
+# patches/ggml-tp-ops.patch): a fused bilinear-gather op (grid_sample) and a
+# channels-first im2col fast path, both needed to hit the M7 performance bar.
+# Applied automatically on fresh checkouts.
+if (NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/ggml/src/ggml-cuda/bilinear-gather.cu)
+    find_package(Git REQUIRED)
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} apply ${CMAKE_CURRENT_SOURCE_DIR}/patches/ggml-tp-ops.patch
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/ggml
+        RESULT_VARIABLE TP_GGML_PATCH_RC)
+    if (NOT TP_GGML_PATCH_RC EQUAL 0)
+        message(FATAL_ERROR "failed to apply patches/ggml-tp-ops.patch to ggml/")
+    endif()
+    message(STATUS "applied patches/ggml-tp-ops.patch to ggml/")
+endif()
+
 add_subdirectory(ggml)
 
 add_library(tp STATIC

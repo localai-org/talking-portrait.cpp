@@ -11,6 +11,11 @@ namespace tp {
 // (f16 weights -> f16 im2col -> tensor-core GEMM).
 inline ggml_tensor *conv2d(ggml_context *ctx, ggml_tensor *a, ggml_tensor *b,
                            int s, int p) {
+    // tiny outputs: the naive direct kernel accumulates like the reference
+    // (per-row cosine on 16-element rows is unforgiving) and costs nothing
+    const int64_t ow = (b->ne[0] + 2 * p - a->ne[0]) / s + 1;
+    const int64_t oh = (b->ne[1] + 2 * p - a->ne[1]) / s + 1;
+    if (ow * oh <= 64) return ggml_conv_2d_direct(ctx, a, b, s, s, p, p, 1, 1);
     ggml_tensor *im = ggml_im2col(ctx, a, b, s, s, p, p, 1, 1, true, a->type);
     ggml_tensor *am = ggml_reshape_2d(ctx, a, a->ne[0] * a->ne[1] * a->ne[2], a->ne[3]);
     ggml_tensor *r = ggml_mul_mat(
