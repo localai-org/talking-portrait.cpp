@@ -425,42 +425,6 @@ struct mdec_build {
                                         ggml_reshape_2d(ctx, gy, 1, NN), 0);  // [2, N]
         return ggml_bilinear_gather(ctx, feat_t, grid, r, r);
     }
-    ggml_tensor *grid_sample_cl_unused(ggml_tensor *feat_t, ggml_tensor *gx, ggml_tensor *gy, int r) {
-        const float half = (float) r / 2.0f;
-        ggml_tensor *fx = ggml_scale_bias(ctx, gx, half, half - 0.5f);  // [r,r]
-        ggml_tensor *fy = ggml_scale_bias(ctx, gy, half, half - 0.5f);
-        ggml_tensor *x0 = ggml_floor(ctx, fx), *y0 = ggml_floor(ctx, fy);
-        ggml_tensor *wx = ggml_sub(ctx, fx, x0), *wy = ggml_sub(ctx, fy, y0);
-        ggml_tensor *one_m_wx = ggml_scale_bias(ctx, wx, -1.0f, 1.0f);
-        ggml_tensor *one_m_wy = ggml_scale_bias(ctx, wy, -1.0f, 1.0f);
-        ggml_tensor *x1 = ggml_scale_bias(ctx, x0, 1.0f, 1.0f);
-        ggml_tensor *y1 = ggml_scale_bias(ctx, y0, 1.0f, 1.0f);
-
-        auto corner = [&](ggml_tensor *cx, ggml_tensor *cy, ggml_tensor *ww) {
-            // in-bounds mask (coords are exact integers)
-            ggml_tensor *ib = ggml_mul(
-                ctx, ggml_clamp(ctx, ggml_scale_bias(ctx, cx, 1.0f, 1.0f), 0.0f, 1.0f),
-                ggml_clamp(ctx, ggml_scale_bias(ctx, cx, -1.0f, (float) r), 0.0f, 1.0f));
-            ib = ggml_mul(ctx, ib,
-                          ggml_mul(ctx, ggml_clamp(ctx, ggml_scale_bias(ctx, cy, 1.0f, 1.0f), 0.0f, 1.0f),
-                                   ggml_clamp(ctx, ggml_scale_bias(ctx, cy, -1.0f, (float) r), 0.0f, 1.0f)));
-            // ggml_clamp is an IN-PLACE view op — clamp a fresh copy, since
-            // cx/cy are shared across the four corner terms
-            ggml_tensor *xc = ggml_clamp(ctx, ggml_scale(ctx, cx, 1.0f), 0.0f, (float) (r - 1));
-            ggml_tensor *yc = ggml_clamp(ctx, ggml_scale(ctx, cy, 1.0f), 0.0f, (float) (r - 1));
-            ggml_tensor *idx = ggml_add(ctx, xc, ggml_scale(ctx, yc, (float) r));
-            idx = ggml_cast(ctx, ggml_reshape_1d(ctx, idx, (int64_t) r * r), GGML_TYPE_I32);
-            ggml_tensor *g = ggml_get_rows(ctx, feat_t, idx);  // [C, r*r] f32
-            ggml_tensor *wgt = ggml_mul(ctx, ww, ib);          // [r,r]
-            wgt = ggml_reshape_2d(ctx, wgt, 1, (int64_t) r * r);
-            return ggml_mul(ctx, g, wgt);
-        };
-        ggml_tensor *acc = corner(x0, y0, ggml_mul(ctx, one_m_wx, one_m_wy));
-        acc = ggml_add(ctx, acc, corner(x1, y0, ggml_mul(ctx, wx, one_m_wy)));
-        acc = ggml_add(ctx, acc, corner(x0, y1, ggml_mul(ctx, one_m_wx, wy)));
-        acc = ggml_add(ctx, acc, corner(x1, y1, ggml_mul(ctx, wx, wy)));
-        return acc;  // [C, r*r]
-    }
 };
 
 bool motion_dec::build(backend_t &be, bool with_taps, std::string &err) {
