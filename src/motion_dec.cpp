@@ -650,9 +650,9 @@ bool motion_dec::build(backend_t &be, bool with_taps, std::string &err) {
 
     // persistent constants: allocated once in their own backend buffer so
     // gallocr can never hand their memory to later graph nodes
-    ggml_tensor *masks[7], *xs_x[7], *xs_y[7], *feats[7], *onec;
+    ggml_tensor *masks[7], *xs_x[7], *xs_y[7], *xsg[7], *feats[7], *onec;
     if (!cctx) {
-        ggml_init_params cp = {ggml_tensor_overhead() * 32, nullptr, true};
+        ggml_init_params cp = {ggml_tensor_overhead() * 64, nullptr, true};
         cctx = ggml_init(cp);
         auto mk = [&](const char *nm, int64_t a, int64_t b,
                       ggml_type tt = GGML_TYPE_F32) {
@@ -670,6 +670,8 @@ bool motion_dec::build(backend_t &be, bool with_taps, std::string &err) {
             mk(nm, r, r);
             snprintf(nm, sizeof nm, "xsy%d", j);
             mk(nm, r, r);
+            snprintf(nm, sizeof nm, "xsg%d", j);
+            mk(nm, (int64_t) r * r, 2);  // planar (xsx | xsy)
             snprintf(nm, sizeof nm, "feat%d", j);
             // channels of feat j == ST_OC[j] (conv{6-j} channels match stage OC)
             mk(nm, ST_OC[j], (int64_t) r * r, w->keep_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32);
@@ -704,6 +706,16 @@ bool motion_dec::build(backend_t &be, bool with_taps, std::string &err) {
                 for (int x = 0; x < r; x++) buf[(size_t) y * r + x] = (float) lin[(size_t) y];
             snprintf(nm, sizeof nm, "xsy%d", j);
             ggml_backend_tensor_set(consts[nm], buf.data(), 0, (size_t) r * r * 4);
+            {
+                std::vector<float> pg((size_t) 2 * r * r);
+                for (int y = 0; y < r; y++)
+                    for (int x = 0; x < r; x++) {
+                        pg[(size_t) y * r + x] = (float) lin[(size_t) x];
+                        pg[(size_t) r * r + (size_t) y * r + x] = (float) lin[(size_t) y];
+                    }
+                snprintf(nm, sizeof nm, "xsg%d", j);
+                ggml_backend_tensor_set(consts[nm], pg.data(), 0, (size_t) 2 * r * r * 4);
+            }
         }
     }
     for (int j = 0; j < 7; j++) {
@@ -714,6 +726,8 @@ bool motion_dec::build(backend_t &be, bool with_taps, std::string &err) {
         xs_x[j] = consts[nm];
         snprintf(nm, sizeof nm, "xsy%d", j);
         xs_y[j] = consts[nm];
+        snprintf(nm, sizeof nm, "xsg%d", j);
+        xsg[j] = consts[nm];
         snprintf(nm, sizeof nm, "feat%d", j);
         feats[j] = consts[nm];
     }
@@ -894,14 +908,15 @@ bool motion_dec::build(backend_t &be, bool with_taps, std::string &err) {
 
         // stages >= spatial_from use the spatial direct-conv path (chunk 1);
         // env TP_MDEC_SPATIAL overrides (7 = none)
-        int spatial_from = 4;
+        int spatial_from = 5;
         if (const char *e = getenv("TP_MDEC_SPATIAL")) {
             spatial_from = atoi(e);
             if (spatial_from < 0 || spatial_from > 7) spatial_from = 7;
         }
         // per-stage batch caps (peak-VRAM guard); env TP_MDEC_BMAX=csv, 0=full
-        int64_t cap[7] = {bsz, bsz, bsz, std::min<int64_t>(bsz, 4), bsz,
-                          std::min<int64_t>(bsz, 2), std::min<int64_t>(bsz, 1)};
+        int64_t cap[7] = {bsz, bsz, bsz, std::min<int64_t>(bsz, 4),
+                          std::min<int64_t>(bsz, 4), std::min<int64_t>(bsz, 1),
+                          std::min<int64_t>(bsz, 1)};
         if (const char *e = getenv("TP_MDEC_BMAX")) {
             char tmp[128];
             snprintf(tmp, sizeof tmp, "%s", e);
@@ -991,13 +1006,24 @@ bool motion_dec::build(backend_t &be, bool with_taps, std::string &err) {
                                       B.upsample2x(sp_slice(skf, c, 1), fup, masks[j]));
                     sfn.t.push_back(fl);
 
-                    ggml_tensor *gx = ggml_add(ctx, ggml_tanh(ctx, flch(fl, 0)), xs_x[j]);
-                    ggml_tensor *gy = ggml_add(ctx, ggml_tanh(ctx, flch(fl, 1)), xs_y[j]);
-                    m = ggml_sigmoid(ctx, flch(fl, 2));  // [r,r,1]
                     // gather in CL layout (coalesced feat reads), then fused
                     // transpose-with-mask ops for warp and trunk
-                    ggml_tensor *sampled = ggml_reshape_2d(
-                        ctx, B.grid_sample_cl(feats[j], gx, gy, r), ST_OC[j], N);
+                    ggml_tensor *sampled;
+                    if (B.fused) {
+                        // one fused pass: (tanh+xs, tanh+xs, sigmoid) -> [N,3]
+                        ggml_tensor *fg = ggml_flow_grid(ctx, fl, xsg[j]);
+                        ggml_tensor *g2 = ggml_view_2d(ctx, fg, N, 2, fg->nb[1], 0);
+                        m = ggml_view_2d(ctx, fg, N, 1, fg->nb[1], (size_t) 2 * N * 4);
+                        sampled = ggml_reshape_2d(
+                            ctx, ggml_bilinear_gather_planar(ctx, feats[j], g2, r, r),
+                            ST_OC[j], N);
+                    } else {
+                        ggml_tensor *gx = ggml_add(ctx, ggml_tanh(ctx, flch(fl, 0)), xs_x[j]);
+                        ggml_tensor *gy = ggml_add(ctx, ggml_tanh(ctx, flch(fl, 1)), xs_y[j]);
+                        m = ggml_sigmoid(ctx, flch(fl, 2));  // [r,r,1]
+                        sampled = ggml_reshape_2d(
+                            ctx, B.grid_sample_cl(feats[j], gx, gy, r), ST_OC[j], N);
+                    }
                     ggml_tensor *warp, *trunk;
                     if (B.fused) {
                         warp = ggml_reshape_4d(ctx, ggml_clsp_mul(ctx, sampled, m),

@@ -1,8 +1,8 @@
 diff --git a/include/ggml.h b/include/ggml.h
-index d6807b6d..c450b7a0 100644
+index d6807b6d..2150423d 100644
 --- a/include/ggml.h
 +++ b/include/ggml.h
-@@ -584,6 +584,14 @@ extern "C" {
+@@ -584,6 +584,15 @@ extern "C" {
  
          GGML_OP_GLU,
  
@@ -13,11 +13,12 @@ index d6807b6d..c450b7a0 100644
 +        GGML_OP_UPFIRDN2X,
 +        GGML_OP_CLSP_MUL,
 +        GGML_OP_CLSP_LERP,
++        GGML_OP_FLOW_GRID,
 +
          GGML_OP_COUNT,
      };
  
-@@ -2018,6 +2026,98 @@ extern "C" {
+@@ -2018,6 +2027,117 @@ extern "C" {
          int                   oc,  // output channels
          int                   p0); // padding to crop from both sides
  
@@ -90,6 +91,25 @@ index d6807b6d..c450b7a0 100644
 +            int                   w,
 +            float                 slope);
 +
++    // fused flow-map head: fl [W, H, 3, 1] (channels gx, gy, m), xs [W, H, 2]
++    // identity grids -> dst [N, 3] planar:
++    //   dst[n]      = tanh(fl ch0) + xs ch0
++    //   dst[N + n]  = tanh(fl ch1) + xs ch1
++    //   dst[2N + n] = sigmoid(fl ch2)
++    GGML_API struct ggml_tensor * ggml_flow_grid(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * fl,
++            struct ggml_tensor  * xs);
++
++    // as ggml_bilinear_gather but grid b is [N, 2] PLANAR (x plane then y
++    // plane) instead of interleaved [2, N]
++    GGML_API struct ggml_tensor * ggml_bilinear_gather_planar(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * a,
++            struct ggml_tensor  * b,
++            int                   w,
++            int                   h);
++
 +    // fused channel-last -> spatial transpose times a per-pixel mask:
 +    // cl [C, N], m [N] -> dst [N, C]: dst[n + N*c] = cl[c + C*n] * m[n]
 +    GGML_API struct ggml_tensor * ggml_clsp_mul(
@@ -117,10 +137,10 @@ index d6807b6d..c450b7a0 100644
              struct ggml_context * ctx,
              struct ggml_tensor  * a,   // convolution kernel
 diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
-index eb8341c9..6f6b15b8 100644
+index eb8341c9..fc73d1cb 100644
 --- a/src/ggml-cpu/ggml-cpu.c
 +++ b/src/ggml-cpu/ggml-cpu.c
-@@ -1956,6 +1956,34 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+@@ -1956,6 +1956,38 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
              {
                  ggml_compute_forward_pad_reflect_1d(params, tensor);
              } break;
@@ -152,10 +172,14 @@ index eb8341c9..6f6b15b8 100644
 +            {
 +                ggml_compute_forward_clsp_lerp(params, tensor);
 +            } break;
++        case GGML_OP_FLOW_GRID:
++            {
++                ggml_compute_forward_flow_grid(params, tensor);
++            } break;
          case GGML_OP_ROLL:
              {
                  ggml_compute_forward_roll(params, tensor);
-@@ -2362,6 +2390,13 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+@@ -2362,6 +2394,14 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
          case GGML_OP_UPSCALE:
          case GGML_OP_PAD:
          case GGML_OP_PAD_REFLECT_1D:
@@ -166,11 +190,12 @@ index eb8341c9..6f6b15b8 100644
 +        case GGML_OP_UPFIRDN2X:
 +        case GGML_OP_CLSP_MUL:
 +        case GGML_OP_CLSP_LERP:
++        case GGML_OP_FLOW_GRID:
          case GGML_OP_ROLL:
          case GGML_OP_ARANGE:
          case GGML_OP_TIMESTEP_EMBEDDING:
 diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
-index 74611dce..50dbfac2 100644
+index 74611dce..cb85ea88 100644
 --- a/src/ggml-cpu/ops.cpp
 +++ b/src/ggml-cpu/ops.cpp
 @@ -6226,15 +6226,17 @@ static void ggml_compute_forward_im2col_f32(
@@ -280,7 +305,7 @@ index 74611dce..50dbfac2 100644
                                      }
                                  }
                              }
-@@ -11485,3 +11501,261 @@ void ggml_compute_forward_fwht(const ggml_compute_params * params, ggml_tensor *
+@@ -11485,3 +11501,293 @@ void ggml_compute_forward_fwht(const ggml_compute_params * params, ggml_tensor *
              }
      }
  }
@@ -301,9 +326,10 @@ index 74611dce..50dbfac2 100644
 +    const int32_t W = ((const int32_t *)(dst->op_params))[0];
 +    const int32_t H = ((const int32_t *)(dst->op_params))[1];
 +    const int32_t sp = ((const int32_t *)(dst->op_params))[2];  // dst [N, C]
++    const int32_t pl = ((const int32_t *)(dst->op_params))[3];  // grid [N, 2] planar
 +
 +    const int64_t C = src0->ne[0];
-+    const int64_t N = src1->ne[1];
++    const int64_t N = pl ? src1->ne[0] : src1->ne[1];
 +
 +    const float * grid = (const float *) src1->data;
 +    float * out = (float *) dst->data;
@@ -312,8 +338,8 @@ index 74611dce..50dbfac2 100644
 +    const int nth = params->nth;
 +
 +    for (int64_t n = ith; n < N; n += nth) {
-+        const float gx = grid[2*n + 0];
-+        const float gy = grid[2*n + 1];
++        const float gx = pl ? grid[n]     : grid[2*n + 0];
++        const float gy = pl ? grid[N + n] : grid[2*n + 1];
 +        const float fx = (gx + 1.0f) * 0.5f * (float) W - 0.5f;
 +        const float fy = (gy + 1.0f) * 0.5f * (float) H - 0.5f;
 +        const int64_t x0 = (int64_t) floorf(fx);
@@ -542,11 +568,42 @@ index 74611dce..50dbfac2 100644
 +        y[i] = a[c + C * n] * m[n] + o[i] * (1.0f - m[n]);
 +    }
 +}
++
++
++// ggml_compute_forward_flow_grid
++// fl [W,H,3,1] -> dst [N,3] planar: (tanh(ch0)+xsx, tanh(ch1)+xsy, sigmoid(ch2))
++
++void ggml_compute_forward_flow_grid(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++
++    const ggml_tensor * fl = dst->src[0];
++    const ggml_tensor * xs = dst->src[1];
++    const int64_t N = fl->ne[0] * fl->ne[1];
++    const float * f = (const float *) fl->data;
++    const float * x = (const float *) xs->data;
++    float * y = (float *) dst->data;
++
++    const int ith = params->ith, nth = params->nth;
++    const int64_t n_tot = 3 * N;
++    const int64_t per = (n_tot + nth - 1) / nth;
++    const int64_t i0 = ith * per, i1 = i0 + per < n_tot ? i0 + per : n_tot;
++    for (int64_t i = i0; i < i1; i++) {
++        const int64_t pln = i / N, n = i % N;
++        float v;
++        if (pln == 2) {
++            v = 1.0f / (1.0f + expf(-f[2 * N + n]));
++        } else {
++            v = tanhf(f[pln * N + n]) + x[pln * N + n];
++        }
++        y[i] = v;
++    }
++}
 diff --git a/src/ggml-cpu/ops.h b/src/ggml-cpu/ops.h
-index a8e18c71..c67c7f03 100644
+index a8e18c71..f8180dc3 100644
 --- a/src/ggml-cpu/ops.h
 +++ b/src/ggml-cpu/ops.h
-@@ -79,6 +79,13 @@ void ggml_compute_forward_pool_2d_back(const struct ggml_compute_params * params
+@@ -79,6 +79,14 @@ void ggml_compute_forward_pool_2d_back(const struct ggml_compute_params * params
  void ggml_compute_forward_upscale(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_pad(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_pad_reflect_1d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
@@ -557,15 +614,16 @@ index a8e18c71..c67c7f03 100644
 +void ggml_compute_forward_upfirdn2x(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 +void ggml_compute_forward_clsp_mul(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 +void ggml_compute_forward_clsp_lerp(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_flow_grid(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_roll(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_arange(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_timestep_embedding(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 diff --git a/src/ggml-cuda/bilinear-gather.cu b/src/ggml-cuda/bilinear-gather.cu
 new file mode 100644
-index 00000000..73a6c92f
+index 00000000..0a3e14c6
 --- /dev/null
 +++ b/src/ggml-cuda/bilinear-gather.cu
-@@ -0,0 +1,69 @@
+@@ -0,0 +1,70 @@
 +// fused bilinear sampling gather (torch grid_sample: bilinear, zeros
 +// padding, align_corners=false) over a channels-first flattened map.
 +//   src0: feat [C, W*H] (F32/F16)  src1: grid [2, N] F32  dst: [C, N] F32
@@ -575,15 +633,15 @@ index 00000000..73a6c92f
 +static __global__ void bilinear_gather_kernel(
 +        const T * __restrict__ feat, const float * __restrict__ grid,
 +        float * __restrict__ dst, const int C, const int W, const int H,
-+        const int64_t N, const int64_t total) {
++        const int64_t N, const int64_t total, const bool planar) {
 +    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
 +    if (i >= total) return;
 +    // dst[i] either way; layout picks the (c, n) decomposition
 +    const int     c = SP ? (int) (i / N) : (int) (i % C);
 +    const int64_t n = SP ? i % N : i / C;
 +
-+    const float gx = grid[2*n + 0];
-+    const float gy = grid[2*n + 1];
++    const float gx = planar ? grid[n]     : grid[2*n + 0];
++    const float gy = planar ? grid[N + n] : grid[2*n + 1];
 +    const float fx = (gx + 1.0f) * 0.5f * (float) W - 0.5f;
 +    const float fy = (gy + 1.0f) * 0.5f * (float) H - 0.5f;
 +    const int x0 = (int) floorf(fx);
@@ -612,8 +670,9 @@ index 00000000..73a6c92f
 +    const int W = ((const int32_t *) dst->op_params)[0];
 +    const int H = ((const int32_t *) dst->op_params)[1];
 +    const bool sp = ((const int32_t *) dst->op_params)[2] != 0;
++    const bool planar = ((const int32_t *) dst->op_params)[3] != 0;
 +    const int C = (int) src0->ne[0];
-+    const int64_t N = src1->ne[1];
++    const int64_t N = planar ? src1->ne[0] : src1->ne[1];
 +    const int64_t total = (int64_t) C * N;
 +
 +    cudaStream_t stream = ctx.stream();
@@ -622,17 +681,17 @@ index 00000000..73a6c92f
 +    if (src0->type == GGML_TYPE_F16) {
 +        if (sp) bilinear_gather_kernel<half, true><<<grid_sz, block, 0, stream>>>(
 +            (const half *) src0->data, (const float *) src1->data,
-+            (float *) dst->data, C, W, H, N, total);
++            (float *) dst->data, C, W, H, N, total, planar);
 +        else bilinear_gather_kernel<half, false><<<grid_sz, block, 0, stream>>>(
 +            (const half *) src0->data, (const float *) src1->data,
-+            (float *) dst->data, C, W, H, N, total);
++            (float *) dst->data, C, W, H, N, total, planar);
 +    } else {
 +        if (sp) bilinear_gather_kernel<float, true><<<grid_sz, block, 0, stream>>>(
 +            (const float *) src0->data, (const float *) src1->data,
-+            (float *) dst->data, C, W, H, N, total);
++            (float *) dst->data, C, W, H, N, total, planar);
 +        else bilinear_gather_kernel<float, false><<<grid_sz, block, 0, stream>>>(
 +            (const float *) src0->data, (const float *) src1->data,
-+            (float *) dst->data, C, W, H, N, total);
++            (float *) dst->data, C, W, H, N, total, planar);
 +    }
 +}
 diff --git a/src/ggml-cuda/bilinear-gather.cuh b/src/ggml-cuda/bilinear-gather.cuh
@@ -645,7 +704,7 @@ index 00000000..0091fb6f
 +
 +void ggml_cuda_op_bilinear_gather(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
-index 61041bdc..da5d50d8 100644
+index 61041bdc..066e7f58 100644
 --- a/src/ggml-cuda/ggml-cuda.cu
 +++ b/src/ggml-cuda/ggml-cuda.cu
 @@ -9,6 +9,8 @@
@@ -657,7 +716,7 @@ index 61041bdc..da5d50d8 100644
  #include "ggml-cuda/binbcast.cuh"
  #include "ggml-cuda/clamp.cuh"
  #include "ggml-cuda/concat.cuh"
-@@ -2997,6 +2999,25 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+@@ -2997,6 +2999,28 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
          case GGML_OP_PAD_REFLECT_1D:
              ggml_cuda_op_pad_reflect_1d(ctx, dst);
              break;
@@ -680,10 +739,13 @@ index 61041bdc..da5d50d8 100644
 +        case GGML_OP_CLSP_LERP:
 +            ggml_cuda_op_clsp(ctx, dst);
 +            break;
++        case GGML_OP_FLOW_GRID:
++            ggml_cuda_op_flow_grid(ctx, dst);
++            break;
          case GGML_OP_ARANGE:
              ggml_cuda_op_arange(ctx, dst);
              break;
-@@ -5459,6 +5480,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5459,6 +5483,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return true;
          case GGML_OP_UPSCALE:
          case GGML_OP_PAD_REFLECT_1D:
@@ -694,6 +756,7 @@ index 61041bdc..da5d50d8 100644
 +        case GGML_OP_UPFIRDN2X:
 +        case GGML_OP_CLSP_MUL:
 +        case GGML_OP_CLSP_LERP:
++        case GGML_OP_FLOW_GRID:
          case GGML_OP_ARANGE:
          case GGML_OP_TIMESTEP_EMBEDDING:
          case GGML_OP_LEAKY_RELU:
@@ -788,10 +851,10 @@ index 28c79ab4..7e1639f3 100644
      const int64_t IH = is_2D ? src1->ne[1] : 1;
 diff --git a/src/ggml-cuda/tp-fused.cu b/src/ggml-cuda/tp-fused.cu
 new file mode 100644
-index 00000000..87656109
+index 00000000..c4de6af5
 --- /dev/null
 +++ b/src/ggml-cuda/tp-fused.cu
-@@ -0,0 +1,166 @@
+@@ -0,0 +1,191 @@
 +// fused pointwise ops for the talking-portrait decoder:
 +//   bias_lrelu:   y = leaky_relu(x + bias[c], slope)
 +//   subpix_lrelu: 2x2 sub-pixel interleave of two parity-group maps + bias
@@ -958,12 +1021,37 @@ index 00000000..87656109
 +            nullptr, (float *) dst->data, n, C, N);
 +    }
 +}
++
++
++static __global__ void flow_grid_kernel(
++        const float * __restrict__ f, const float * __restrict__ x,
++        float * __restrict__ y, const int64_t N) {
++    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= 3 * N) return;
++    const int64_t pln = i / N, n = i % N;
++    float v;
++    if (pln == 2) {
++        v = 1.0f / (1.0f + expf(-f[2 * N + n]));
++    } else {
++        v = tanhf(f[pln * N + n]) + x[pln * N + n];
++    }
++    y[i] = v;
++}
++
++void ggml_cuda_op_flow_grid(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * fl = dst->src[0];
++    const int64_t N = fl->ne[0] * fl->ne[1];
++    const int block = 256;
++    flow_grid_kernel<<<(3 * N + block - 1) / block, block, 0, ctx.stream()>>>(
++        (const float *) fl->data, (const float *) dst->src[1]->data,
++        (float *) dst->data, N);
++}
 diff --git a/src/ggml-cuda/tp-fused.cuh b/src/ggml-cuda/tp-fused.cuh
 new file mode 100644
-index 00000000..6f9f0bc0
+index 00000000..7a3008b4
 --- /dev/null
 +++ b/src/ggml-cuda/tp-fused.cuh
-@@ -0,0 +1,7 @@
+@@ -0,0 +1,8 @@
 +#include "common.cuh"
 +
 +void ggml_cuda_op_bias_lrelu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
@@ -971,11 +1059,12 @@ index 00000000..6f9f0bc0
 +void ggml_cuda_op_subpix_lrelu_cl(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 +void ggml_cuda_op_upfirdn2x(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 +void ggml_cuda_op_clsp(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++void ggml_cuda_op_flow_grid(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
-index 1b1150e7..1d5fb1a1 100644
+index 1b1150e7..94f27b77 100644
 --- a/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/src/ggml-vulkan/ggml-vulkan.cpp
-@@ -899,6 +899,11 @@ struct vk_device_struct {
+@@ -899,6 +899,12 @@ struct vk_device_struct {
      std::map<vk_solve_tri_pipeline_state, vk_pipeline> pipeline_solve_tri_f32;
      vk_pipeline pipeline_im2col_f32, pipeline_im2col_f32_f16;
      vk_pipeline pipeline_im2col_3d_f32, pipeline_im2col_3d_f32_f16;
@@ -984,10 +1073,11 @@ index 1b1150e7..1d5fb1a1 100644
 +    vk_pipeline pipeline_bias_lrelu_f32, pipeline_subpix_lrelu_f32;
 +    vk_pipeline pipeline_subpix_lrelu_cl_f32, pipeline_upfirdn2x_f32;
 +    vk_pipeline pipeline_clsp_mul_f32, pipeline_clsp_lerp_f32;
++    vk_pipeline pipeline_flow_grid_f32;
      vk_pipeline pipeline_timestep_embedding_f32;
      vk_pipeline pipeline_conv_transpose_1d_f32;
      vk_pipeline pipeline_snake_f32;
-@@ -1525,6 +1530,66 @@ struct vk_op_timestep_embedding_push_constants {
+@@ -1525,6 +1531,71 @@ struct vk_op_timestep_embedding_push_constants {
      uint32_t max_period;
  };
  
@@ -1013,6 +1103,7 @@ index 1b1150e7..1d5fb1a1 100644
 +    uint32_t W;
 +    uint32_t H;
 +    uint32_t sp;
++    uint32_t pl;
 +};
 +
 +struct vk_op_bias_lrelu_push_constants {
@@ -1051,10 +1142,14 @@ index 1b1150e7..1d5fb1a1 100644
 +    uint32_t N;
 +};
 +
++struct vk_op_flow_grid_push_constants {
++    uint32_t N;
++};
++
  struct vk_op_conv_transpose_1d_push_constants {
      uint32_t Cout;
      uint32_t Cin;
-@@ -5171,6 +5236,19 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+@@ -5171,6 +5242,20 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
          IM2COL()
      }
  
@@ -1070,11 +1165,12 @@ index 1b1150e7..1d5fb1a1 100644
 +    ggml_vk_create_pipeline(device, device->pipeline_upfirdn2x_f32, "upfirdn2x_f32", upfirdn2x_f32_len, upfirdn2x_f32_data, "main", 3, sizeof(vk_op_upfirdn2x_push_constants), {256, 1, 1}, {}, 1);
 +    ggml_vk_create_pipeline(device, device->pipeline_clsp_mul_f32, "clsp_mul_f32", clsp_mul_f32_len, clsp_mul_f32_data, "main", 3, sizeof(vk_op_clsp_push_constants), {256, 1, 1}, {}, 1);
 +    ggml_vk_create_pipeline(device, device->pipeline_clsp_lerp_f32, "clsp_lerp_f32", clsp_lerp_f32_len, clsp_lerp_f32_data, "main", 4, sizeof(vk_op_clsp_push_constants), {256, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_flow_grid_f32, "flow_grid_f32", flow_grid_f32_len, flow_grid_f32_data, "main", 3, sizeof(vk_op_flow_grid_push_constants), {256, 1, 1}, {}, 1);
 +
      ggml_vk_create_pipeline(device, device->pipeline_timestep_embedding_f32, "timestep_embedding_f32", timestep_embedding_f32_len, timestep_embedding_f32_data, "main", 2, sizeof(vk_op_timestep_embedding_push_constants), {256, 1, 1}, {}, 1);
  
      ggml_vk_create_pipeline(device, device->pipeline_conv_transpose_1d_f32, "conv_transpose_1d_f32", conv_transpose_1d_f32_len, conv_transpose_1d_f32_data, "main", 3, sizeof(vk_op_conv_transpose_1d_push_constants), {1, 1, 1}, {}, 1);
-@@ -10627,6 +10705,16 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const
+@@ -10627,6 +10712,16 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const
          }
          return nullptr;
      case GGML_OP_IM2COL:
@@ -1091,7 +1187,7 @@ index 1b1150e7..1d5fb1a1 100644
          if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
              return ctx->device->pipeline_im2col_f32;
          }
-@@ -10642,6 +10730,46 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const
+@@ -10642,6 +10737,51 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const
              return ctx->device->pipeline_im2col_3d_f32_f16;
          }
          return nullptr;
@@ -1135,10 +1231,15 @@ index 1b1150e7..1d5fb1a1 100644
 +            return ctx->device->pipeline_clsp_lerp_f32;
 +        }
 +        return nullptr;
++    case GGML_OP_FLOW_GRID:
++        if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
++            return ctx->device->pipeline_flow_grid_f32;
++        }
++        return nullptr;
      case GGML_OP_TIMESTEP_EMBEDDING:
          if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
              return ctx->device->pipeline_timestep_embedding_f32;
-@@ -11030,6 +11158,13 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
+@@ -11030,6 +11170,13 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
          break;
      case GGML_OP_IM2COL:
          {
@@ -1152,7 +1253,7 @@ index 1b1150e7..1d5fb1a1 100644
              const bool is_2D = dst->op_params[6] == 1;
  
              const uint32_t IC = src1->ne[is_2D ? 2 : 1];
-@@ -11072,6 +11207,15 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
+@@ -11072,6 +11219,16 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
              elements = { IC_KD_KH_KW, OW, N_OD_OH };
              elements[2] = std::min(elements[2], ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
          } break;
@@ -1163,12 +1264,13 @@ index 1b1150e7..1d5fb1a1 100644
 +    case GGML_OP_UPFIRDN2X:
 +    case GGML_OP_CLSP_MUL:
 +    case GGML_OP_CLSP_LERP:
++    case GGML_OP_FLOW_GRID:
 +        elements = { (uint32_t)ggml_nelements(dst), 1, 1 };
 +        break;
      case GGML_OP_TIMESTEP_EMBEDDING:
          {
              const uint32_t dim = dst->op_params[0];
-@@ -11226,8 +11370,10 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
+@@ -11226,8 +11383,10 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
          vk_subbuffer subbuf3 = use_src3 ? src3_buf : src0_buf;
          ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, subbuf2, dst_buf, subbuf3 }, pc, elements);
      } else if (op == GGML_OP_IM2COL || op == GGML_OP_IM2COL_3D) {
@@ -1180,7 +1282,7 @@ index 1b1150e7..1d5fb1a1 100644
              dst_buf.size = 1;
          }
          // im2col uses only src1 and dst buffers
-@@ -12723,6 +12869,22 @@ static void ggml_vk_im2col(ggml_backend_vk_context * ctx, vk_context& subctx, co
+@@ -12723,6 +12882,22 @@ static void ggml_vk_im2col(ggml_backend_vk_context * ctx, vk_context& subctx, co
      const int32_t d0 = dst->op_params[4];
      const int32_t d1 = dst->op_params[5];
  
@@ -1203,7 +1305,7 @@ index 1b1150e7..1d5fb1a1 100644
      const bool is_2D = dst->op_params[6] == 1;
  
      const uint32_t IC = src1->ne[is_2D ? 2 : 1];
-@@ -12755,6 +12917,55 @@ static void ggml_vk_im2col(ggml_backend_vk_context * ctx, vk_context& subctx, co
+@@ -12755,6 +12930,63 @@ static void ggml_vk_im2col(ggml_backend_vk_context * ctx, vk_context& subctx, co
      });
  }
  
@@ -1211,8 +1313,10 @@ index 1b1150e7..1d5fb1a1 100644
 +    const uint32_t W = (uint32_t)((const int32_t *) dst->op_params)[0];
 +    const uint32_t H = (uint32_t)((const int32_t *) dst->op_params)[1];
 +    const uint32_t sp = (uint32_t)((const int32_t *) dst->op_params)[2];
++    const uint32_t pl = (uint32_t)((const int32_t *) dst->op_params)[3];
++    const uint32_t NN = pl ? (uint32_t)src1->ne[0] : (uint32_t)src1->ne[1];
 +    ggml_vk_op_f32<vk_op_bilinear_gather_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_BILINEAR_GATHER, {
-+        (uint32_t)src0->ne[0], (uint32_t)src1->ne[1], W, H, sp
++        (uint32_t)src0->ne[0], NN, W, H, sp, pl
 +    });
 +}
 +
@@ -1256,10 +1360,16 @@ index 1b1150e7..1d5fb1a1 100644
 +    });
 +}
 +
++static void ggml_vk_flow_grid(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++    ggml_vk_op_f32<vk_op_flow_grid_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_FLOW_GRID, {
++        (uint32_t)(src0->ne[0] * src0->ne[1])
++    });
++}
++
  static void ggml_vk_im2col_3d(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      GGML_TENSOR_BINARY_OP_LOCALS
  
-@@ -14344,6 +14555,34 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+@@ -14344,6 +14576,38 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
      case GGML_OP_IM2COL_3D:
          ggml_vk_im2col_3d(ctx, compute_ctx, src0, src1, node);
  
@@ -1291,10 +1401,14 @@ index 1b1150e7..1d5fb1a1 100644
 +    case GGML_OP_CLSP_LERP:
 +        ggml_vk_clsp(ctx, compute_ctx, src0, src1, node->src[2], node);
 +
++        break;
++    case GGML_OP_FLOW_GRID:
++        ggml_vk_flow_grid(ctx, compute_ctx, src0, src1, node);
++
          break;
      case GGML_OP_TIMESTEP_EMBEDDING:
          ggml_vk_timestep_embedding(ctx, compute_ctx, src0, node);
-@@ -17041,6 +17280,23 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+@@ -17041,6 +17305,24 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
          case GGML_OP_IM2COL_3D:
              return op->src[1]->type == GGML_TYPE_F32
                  && (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16);
@@ -1310,6 +1424,7 @@ index 1b1150e7..1d5fb1a1 100644
 +        case GGML_OP_UPFIRDN2X:
 +        case GGML_OP_CLSP_MUL:
 +        case GGML_OP_CLSP_LERP:
++        case GGML_OP_FLOW_GRID:
 +            return op->src[0]->type == GGML_TYPE_F32
 +                && op->src[1]->type == GGML_TYPE_F32
 +                && op->type == GGML_TYPE_F32
@@ -1318,7 +1433,7 @@ index 1b1150e7..1d5fb1a1 100644
          case GGML_OP_TIMESTEP_EMBEDDING:
              return op->src[0]->type == GGML_TYPE_F32;
          case GGML_OP_CONV_2D_DW:
-@@ -17910,8 +18166,15 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
+@@ -17910,8 +18192,15 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
              const int32_t d0 = tensor->op_params[4];
              const int32_t d1 = tensor->op_params[5];
  
@@ -1378,10 +1493,10 @@ index 00000000..07179cce
 +}
 diff --git a/src/ggml-vulkan/vulkan-shaders/bilinear_gather.comp b/src/ggml-vulkan/vulkan-shaders/bilinear_gather.comp
 new file mode 100644
-index 00000000..1b4f15ac
+index 00000000..ae145e24
 --- /dev/null
 +++ b/src/ggml-vulkan/vulkan-shaders/bilinear_gather.comp
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,57 @@
 +#version 450
 +// fused bilinear sampling gather (torch grid_sample: bilinear, zeros
 +// padding, align_corners=false) over a channels-first flattened map.
@@ -1400,6 +1515,7 @@ index 00000000..1b4f15ac
 +    uint W;
 +    uint H;
 +    uint sp;  // dst layout: 0 = [C, N], 1 = [N, C]
++    uint pl;  // grid layout: 0 = [2, N] interleaved, 1 = [N, 2] planar
 +} p;
 +
 +layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
@@ -1416,8 +1532,8 @@ index 00000000..1b4f15ac
 +    const uint c = p.sp != 0 ? i / p.N : i % p.C;
 +    const uint n = p.sp != 0 ? i % p.N : i / p.C;
 +
-+    const float gx = float(data_b[2*n + 0]);
-+    const float gy = float(data_b[2*n + 1]);
++    const float gx = float(p.pl != 0 ? data_b[n]       : data_b[2*n + 0]);
++    const float gy = float(p.pl != 0 ? data_b[p.N + n] : data_b[2*n + 1]);
 +    const float fx = (gx + 1.0f) * 0.5f * float(p.W) - 0.5f;
 +    const float fy = (gy + 1.0f) * 0.5f * float(p.H) - 0.5f;
 +    const int x0 = int(floor(fx));
@@ -1486,6 +1602,47 @@ index 00000000..6d1d4cad
 +#ifdef LERP
 +    v += float(data_c[i]) * (1.0f - w);
 +#endif
++    data_d[i] = D_TYPE(v);
++}
+diff --git a/src/ggml-vulkan/vulkan-shaders/flow_grid.comp b/src/ggml-vulkan/vulkan-shaders/flow_grid.comp
+new file mode 100644
+index 00000000..28c9b7c7
+--- /dev/null
++++ b/src/ggml-vulkan/vulkan-shaders/flow_grid.comp
+@@ -0,0 +1,35 @@
++#version 450
++// fused flow-map head: fl [W, H, 3] (channels gx, gy, m), xs [W, H, 2]
++// identity grids -> dst [N, 3] planar (see ggml.h):
++//   binding 0: fl f32
++//   binding 1: xs f32
++//   binding 2: dst f32 [N, 3]
++
++#include "types.glsl"
++
++layout (push_constant) uniform parameter
++{
++    uint N;
++} p;
++
++layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
++
++layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
++layout (binding = 1) readonly buffer B {B_TYPE data_b[];};
++layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
++
++void main() {
++    const uint i = gl_GlobalInvocationID.x;
++    if (i >= 3u * p.N) {
++        return;
++    }
++    const uint pln = i / p.N;
++    const uint n = i % p.N;
++    float v;
++    if (pln == 2u) {
++        v = 1.0f / (1.0f + exp(-float(data_a[2u * p.N + n])));
++    } else {
++        v = tanh(float(data_a[pln * p.N + n])) + float(data_b[pln * p.N + n]);
++    }
 +    data_d[i] = D_TYPE(v);
 +}
 diff --git a/src/ggml-vulkan/vulkan-shaders/im2col_cf.comp b/src/ggml-vulkan/vulkan-shaders/im2col_cf.comp
@@ -1696,10 +1853,10 @@ index 00000000..eac00aad
 +    data_d[i] = D_TYPE(acc);
 +}
 diff --git a/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
-index 7bcb1460..7e0e6f0e 100644
+index 7bcb1460..faa88f3f 100644
 --- a/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
 +++ b/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
-@@ -997,6 +997,19 @@ void process_shaders() {
+@@ -997,6 +997,20 @@ void process_shaders() {
          }
      }
  
@@ -1715,15 +1872,16 @@ index 7bcb1460..7e0e6f0e 100644
 +    string_to_spv("upfirdn2x_f32", "upfirdn2x.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
 +    string_to_spv("clsp_mul_f32", "clsp.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
 +    string_to_spv("clsp_lerp_f32", "clsp.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"LERP", "1"}}));
++    string_to_spv("flow_grid_f32", "flow_grid.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
 +
      string_to_spv("timestep_embedding_f32", "timestep_embedding.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
  
      string_to_spv("conv_transpose_1d_f32", "conv_transpose_1d.comp", {{"A_TYPE", "float"},  {"B_TYPE", "float"}, {"D_TYPE", "float"}});
 diff --git a/src/ggml.c b/src/ggml.c
-index b43016c8..5b379393 100644
+index b43016c8..9ab878bc 100644
 --- a/src/ggml.c
 +++ b/src/ggml.c
-@@ -1079,9 +1079,17 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+@@ -1079,9 +1079,18 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
      "OPT_STEP_SGD",
  
      "GLU",
@@ -1735,14 +1893,15 @@ index b43016c8..5b379393 100644
 +    "UPFIRDN2X",
 +    "CLSP_MUL",
 +    "CLSP_LERP",
++    "FLOW_GRID",
  };
  
 -static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
-+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
++static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
  
  static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
      "none",
-@@ -1190,9 +1198,16 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+@@ -1190,9 +1199,17 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
      "sgd(x)",
  
      "glu(x)",
@@ -1753,14 +1912,15 @@ index b43016c8..5b379393 100644
 +    "upfirdn2x(x)",
 +    "clsp_mul(x)",
 +    "clsp_lerp(x)",
++    "flow_grid(x)",
  };
  
 -static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
-+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
++static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
  
  static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
  
-@@ -4482,6 +4497,224 @@ struct ggml_tensor * ggml_im2col_back(
+@@ -4482,6 +4499,267 @@ struct ggml_tensor * ggml_im2col_back(
  
  // ggml_conv_1d
  
@@ -1813,6 +1973,49 @@ index b43016c8..5b379393 100644
 +
 +    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, a->ne[0], b->ne[1]);
 +    int32_t params[] = { w, h, 0 };
++    ggml_set_op_params(result, params, sizeof(params));
++
++    result->op     = GGML_OP_BILINEAR_GATHER;
++    result->src[0] = a;
++    result->src[1] = b;
++
++    return result;
++}
++
++struct ggml_tensor * ggml_flow_grid(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * fl,
++        struct ggml_tensor  * xs) {
++    GGML_ASSERT(fl->type == GGML_TYPE_F32 && xs->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(fl) && ggml_is_contiguous(xs));
++    GGML_ASSERT(fl->ne[2] == 3 && fl->ne[3] == 1);
++    GGML_ASSERT(ggml_nelements(xs) == 2 * fl->ne[0] * fl->ne[1]);
++
++    const int64_t N = fl->ne[0] * fl->ne[1];
++    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, N, 3);
++
++    result->op     = GGML_OP_FLOW_GRID;
++    result->src[0] = fl;
++    result->src[1] = xs;
++
++    return result;
++}
++
++struct ggml_tensor * ggml_bilinear_gather_planar(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * a,
++        struct ggml_tensor  * b,
++        int                   w,
++        int                   h) {
++    GGML_ASSERT(a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16);
++    GGML_ASSERT(b->type == GGML_TYPE_F32);
++    GGML_ASSERT(b->ne[1] == 2);
++    GGML_ASSERT(ggml_is_contiguous(a));
++    GGML_ASSERT(ggml_is_contiguous(b));
++    GGML_ASSERT(a->ne[1] == (int64_t) w * h);
++
++    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, a->ne[0], b->ne[0]);
++    int32_t params[] = { w, h, 0, 1 };
 +    ggml_set_op_params(result, params, sizeof(params));
 +
 +    result->op     = GGML_OP_BILINEAR_GATHER;
