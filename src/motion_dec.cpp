@@ -633,6 +633,14 @@ struct mdec_build {
         ggml_tensor *s = ggml_bilinear_gather(ctx, feat_t, grid, r, r);
         return ggml_reshape_3d(ctx, s, s->ne[0], (int64_t) r * r, Bc);
     }
+    // spatial-layout variant: [r, r, C, 1] with no transpose (chunk size 1)
+    ggml_tensor *grid_sample_sp(ggml_tensor *feat_t, ggml_tensor *gx, ggml_tensor *gy, int r) {
+        const int64_t NN = (int64_t) r * r;
+        ggml_tensor *grid = ggml_concat(ctx, ggml_reshape_2d(ctx, gx, 1, NN),
+                                        ggml_reshape_2d(ctx, gy, 1, NN), 0);  // [2, N]
+        ggml_tensor *s = ggml_bilinear_gather_sp(ctx, feat_t, grid, r, r);    // [N, C]
+        return ggml_reshape_4d(ctx, s, r, r, s->ne[1], 1);
+    }
 };
 
 bool motion_dec::build(backend_t &be, bool with_taps, std::string &err) {
@@ -727,7 +735,7 @@ bool motion_dec::build(backend_t &be, bool with_taps, std::string &err) {
     batch = bsz;
 
     plan_t &p = frame;
-    p.begin(4096);
+    p.begin(2048 + (size_t) bsz * 512);
     ggml_context *ctx = p.ctx;
     mdec_build B{p, ctx, w, derived};
     B.fused = !exact_graph && getenv("TP_MDEC_NOFUSED") == nullptr;
@@ -985,6 +993,9 @@ bool motion_dec::build(backend_t &be, bool with_taps, std::string &err) {
                     ggml_tensor *gy = ggml_add(ctx, ggml_tanh(ctx, flch(fl, 1)), xs_y[j]);
                     m = ggml_sigmoid(ctx, flch(fl, 2));  // [r,r,1]
                     ggml_tensor *m4 = ggml_reshape_4d(ctx, m, r, r, 1, 1);
+                    // note: the layout-direct gather (grid_sample_sp) loses
+                    // feat-read coalescing and measures slower than
+                    // gather-CL + transpose; keep the CL form
                     ggml_tensor *sampled_sp = B.cl_to_sp(
                         B.grid_sample_cl(feats[j], gx, gy, r), r, r);  // [r,r,C,1]
                     ggml_tensor *warp = ggml_mul(ctx, sampled_sp, m4);
