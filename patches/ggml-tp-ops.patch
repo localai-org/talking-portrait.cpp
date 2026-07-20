@@ -1,17 +1,19 @@
 diff --git a/include/ggml.h b/include/ggml.h
-index d6807b6d..697f131c 100644
+index d6807b6d..86193859 100644
 --- a/include/ggml.h
 +++ b/include/ggml.h
-@@ -584,6 +584,8 @@ extern "C" {
+@@ -584,6 +584,10 @@ extern "C" {
  
          GGML_OP_GLU,
  
 +        GGML_OP_BILINEAR_GATHER,
++        GGML_OP_BIAS_LRELU,
++        GGML_OP_SUBPIX_LRELU,
 +
          GGML_OP_COUNT,
      };
  
-@@ -2018,6 +2020,34 @@ extern "C" {
+@@ -2018,6 +2022,56 @@ extern "C" {
          int                   oc,  // output channels
          int                   p0); // padding to crop from both sides
  
@@ -43,14 +45,36 @@ index d6807b6d..697f131c 100644
 +            int                   w,
 +            int                   h);
 +
++    // fused y = leaky_relu(x + bias, slope). bias: C contiguous F32 values,
++    // broadcast on dim `axis` of x (0 = channel-fastest, 2 = spatial maps);
++    // all other bias dims must be 1 in x-broadcast terms.
++    GGML_API struct ggml_tensor * ggml_bias_lrelu(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * x,
++            struct ggml_tensor  * bias,
++            int                   axis,
++            float                 slope);
++
++    // fused 2x2 sub-pixel interleave + bias + leaky_relu over two parity
++    // group maps g0 (rows by=0: classes bx=0,1) and g1 (by=1), each
++    // [W, H, 2*OC, 1] with channel q = bx*OC + o; bias OC values.
++    //   dst [2W, 2H, OC, 1]:
++    //   dst[2n+bx, 2m+by, o] = lrelu(g{by}[n, m, o + OC*bx] + bias[o])
++    GGML_API struct ggml_tensor * ggml_subpix_lrelu(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * g0,
++            struct ggml_tensor  * g1,
++            struct ggml_tensor  * bias,
++            float                 slope);
++
      GGML_API struct ggml_tensor * ggml_conv_1d(
              struct ggml_context * ctx,
              struct ggml_tensor  * a,   // convolution kernel
 diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
-index eb8341c9..42f69250 100644
+index eb8341c9..5d1f6ec7 100644
 --- a/src/ggml-cpu/ggml-cpu.c
 +++ b/src/ggml-cpu/ggml-cpu.c
-@@ -1956,6 +1956,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+@@ -1956,6 +1956,18 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
              {
                  ggml_compute_forward_pad_reflect_1d(params, tensor);
              } break;
@@ -58,19 +82,29 @@ index eb8341c9..42f69250 100644
 +            {
 +                ggml_compute_forward_bilinear_gather(params, tensor);
 +            } break;
++        case GGML_OP_BIAS_LRELU:
++            {
++                ggml_compute_forward_bias_lrelu(params, tensor);
++            } break;
++        case GGML_OP_SUBPIX_LRELU:
++            {
++                ggml_compute_forward_subpix_lrelu(params, tensor);
++            } break;
          case GGML_OP_ROLL:
              {
                  ggml_compute_forward_roll(params, tensor);
-@@ -2362,6 +2366,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+@@ -2362,6 +2374,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
          case GGML_OP_UPSCALE:
          case GGML_OP_PAD:
          case GGML_OP_PAD_REFLECT_1D:
 +        case GGML_OP_BILINEAR_GATHER:
++        case GGML_OP_BIAS_LRELU:
++        case GGML_OP_SUBPIX_LRELU:
          case GGML_OP_ROLL:
          case GGML_OP_ARANGE:
          case GGML_OP_TIMESTEP_EMBEDDING:
 diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
-index 74611dce..fac5d763 100644
+index 74611dce..c0de4827 100644
 --- a/src/ggml-cpu/ops.cpp
 +++ b/src/ggml-cpu/ops.cpp
 @@ -6226,15 +6226,17 @@ static void ggml_compute_forward_im2col_f32(
@@ -180,7 +214,7 @@ index 74611dce..fac5d763 100644
                                      }
                                  }
                              }
-@@ -11485,3 +11501,58 @@ void ggml_compute_forward_fwht(const ggml_compute_params * params, ggml_tensor *
+@@ -11485,3 +11501,131 @@ void ggml_compute_forward_fwht(const ggml_compute_params * params, ggml_tensor *
              }
      }
  }
@@ -239,15 +273,90 @@ index 74611dce..fac5d763 100644
 +        }
 +    }
 +}
++
++
++// ggml_compute_forward_bias_lrelu
++// y = leaky_relu(x + bias): src0 x (F32 contiguous), src1 bias (C floats),
++// broadcast on op_params[0] axis (0 or 2); slope in op_params[1].
++
++void ggml_compute_forward_bias_lrelu(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++
++    const ggml_tensor * src0 = dst->src[0];
++    const ggml_tensor * src1 = dst->src[1];
++
++    const int32_t axis = ((const int32_t *)(dst->op_params))[0];
++    float slope;
++    memcpy(&slope, (const int32_t *)(dst->op_params) + 1, sizeof(float));
++
++    const int64_t C  = ggml_nelements(src1);
++    const int64_t n  = ggml_nelements(src0);
++    const int64_t d01 = src0->ne[0] * src0->ne[1];
++
++    const float * x = (const float *) src0->data;
++    const float * b = (const float *) src1->data;
++    float * y = (float *) dst->data;
++
++    const int ith = params->ith;
++    const int nth = params->nth;
++    const int64_t per = (n + nth - 1) / nth;
++    const int64_t i0 = ith * per, i1 = i0 + per < n ? i0 + per : n;
++
++    for (int64_t i = i0; i < i1; i++) {
++        const int64_t c = axis == 0 ? i % C : (i / d01) % C;
++        const float v = x[i] + b[c];
++        y[i] = v > 0.0f ? v : slope * v;
++    }
++}
++
++// ggml_compute_forward_subpix_lrelu
++// dst[2n+bx, 2m+by, o] = lrelu(g{by}[n, m, o + OC*bx] + bias[o])
++
++void ggml_compute_forward_subpix_lrelu(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++
++    const ggml_tensor * g0 = dst->src[0];
++    const ggml_tensor * g1 = dst->src[1];
++    const ggml_tensor * bias = dst->src[2];
++
++    float slope;
++    memcpy(&slope, dst->op_params, sizeof(float));
++
++    const int64_t W  = g0->ne[0];
++    const int64_t H  = g0->ne[1];
++    const int64_t OC = g0->ne[2] / 2;
++    const int64_t n  = ggml_nelements(dst);
++
++    const float * b = (const float *) bias->data;
++    float * y = (float *) dst->data;
++
++    const int ith = params->ith;
++    const int nth = params->nth;
++    const int64_t per = (n + nth - 1) / nth;
++    const int64_t i0 = ith * per, i1 = i0 + per < n ? i0 + per : n;
++
++    for (int64_t i = i0; i < i1; i++) {
++        const int64_t xx = i % (2 * W);
++        const int64_t yy = (i / (2 * W)) % (2 * H);
++        const int64_t o  = i / (4 * W * H);
++        const float * g = (const float *) ((yy & 1) ? g1->data : g0->data);
++        const float v = g[(xx >> 1) + W * ((yy >> 1) + H * (o + OC * (xx & 1)))] + b[o];
++        y[i] = v > 0.0f ? v : slope * v;
++    }
++}
 diff --git a/src/ggml-cpu/ops.h b/src/ggml-cpu/ops.h
-index a8e18c71..82e51728 100644
+index a8e18c71..96591c3c 100644
 --- a/src/ggml-cpu/ops.h
 +++ b/src/ggml-cpu/ops.h
-@@ -79,6 +79,7 @@ void ggml_compute_forward_pool_2d_back(const struct ggml_compute_params * params
+@@ -79,6 +79,9 @@ void ggml_compute_forward_pool_2d_back(const struct ggml_compute_params * params
  void ggml_compute_forward_upscale(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_pad(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_pad_reflect_1d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 +void ggml_compute_forward_bilinear_gather(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_bias_lrelu(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_subpix_lrelu(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_roll(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_arange(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_timestep_embedding(const struct ggml_compute_params * params, struct ggml_tensor * dst);
@@ -328,32 +437,41 @@ index 00000000..0091fb6f
 +
 +void ggml_cuda_op_bilinear_gather(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
-index 61041bdc..ea0cd7a8 100644
+index 61041bdc..b48cc6a5 100644
 --- a/src/ggml-cuda/ggml-cuda.cu
 +++ b/src/ggml-cuda/ggml-cuda.cu
-@@ -9,6 +9,7 @@
+@@ -9,6 +9,8 @@
  #include "ggml-cuda/arange.cuh"
  #include "ggml-cuda/argmax.cuh"
  #include "ggml-cuda/argsort.cuh"
 +#include "ggml-cuda/bilinear-gather.cuh"
++#include "ggml-cuda/tp-fused.cuh"
  #include "ggml-cuda/binbcast.cuh"
  #include "ggml-cuda/clamp.cuh"
  #include "ggml-cuda/concat.cuh"
-@@ -2997,6 +2998,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+@@ -2997,6 +2999,15 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
          case GGML_OP_PAD_REFLECT_1D:
              ggml_cuda_op_pad_reflect_1d(ctx, dst);
              break;
 +        case GGML_OP_BILINEAR_GATHER:
 +            ggml_cuda_op_bilinear_gather(ctx, dst);
 +            break;
++        case GGML_OP_BIAS_LRELU:
++            ggml_cuda_op_bias_lrelu(ctx, dst);
++            break;
++        case GGML_OP_SUBPIX_LRELU:
++            ggml_cuda_op_subpix_lrelu(ctx, dst);
++            break;
          case GGML_OP_ARANGE:
              ggml_cuda_op_arange(ctx, dst);
              break;
-@@ -5459,6 +5463,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5459,6 +5470,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return true;
          case GGML_OP_UPSCALE:
          case GGML_OP_PAD_REFLECT_1D:
 +        case GGML_OP_BILINEAR_GATHER:
++        case GGML_OP_BIAS_LRELU:
++        case GGML_OP_SUBPIX_LRELU:
          case GGML_OP_ARANGE:
          case GGML_OP_TIMESTEP_EMBEDDING:
          case GGML_OP_LEAKY_RELU:
@@ -446,20 +564,101 @@ index 28c79ab4..7e1639f3 100644
  
      const int64_t IC = src1->ne[is_2D ? 2 : 1];
      const int64_t IH = is_2D ? src1->ne[1] : 1;
+diff --git a/src/ggml-cuda/tp-fused.cu b/src/ggml-cuda/tp-fused.cu
+new file mode 100644
+index 00000000..84ec690e
+--- /dev/null
++++ b/src/ggml-cuda/tp-fused.cu
+@@ -0,0 +1,64 @@
++// fused pointwise ops for the talking-portrait decoder:
++//   bias_lrelu:   y = leaky_relu(x + bias[c], slope)
++//   subpix_lrelu: 2x2 sub-pixel interleave of two parity-group maps + bias
++//                 + leaky_relu (see ggml.h)
++#include "tp-fused.cuh"
++
++static __global__ void bias_lrelu_kernel(
++        const float * __restrict__ x, const float * __restrict__ b,
++        float * __restrict__ y, const int64_t n, const int C,
++        const int64_t d01, const int axis, const float slope) {
++    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= n) return;
++    const int c = axis == 0 ? (int)(i % C) : (int)((i / d01) % C);
++    const float v = x[i] + b[c];
++    y[i] = v > 0.0f ? v : slope * v;
++}
++
++static __global__ void subpix_lrelu_kernel(
++        const float * __restrict__ g0, const float * __restrict__ g1,
++        const float * __restrict__ b, float * __restrict__ y,
++        const int64_t n, const int W, const int H, const int OC,
++        const float slope) {
++    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= n) return;
++    const int xx = (int)(i % (2 * W));
++    const int yy = (int)((i / (2 * W)) % (2 * H));
++    const int o  = (int)(i / ((int64_t) 4 * W * H));
++    const float * g = (yy & 1) ? g1 : g0;
++    const float v = g[(xx >> 1) + (int64_t) W * ((yy >> 1) + (int64_t) H * (o + OC * (xx & 1)))] + b[o];
++    y[i] = v > 0.0f ? v : slope * v;
++}
++
++void ggml_cuda_op_bias_lrelu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * src0 = dst->src[0];
++    const ggml_tensor * src1 = dst->src[1];
++    const int axis = ((const int32_t *) dst->op_params)[0];
++    float slope;
++    memcpy(&slope, (const int32_t *) dst->op_params + 1, sizeof(float));
++    const int64_t n = ggml_nelements(src0);
++    const int C = (int) ggml_nelements(src1);
++    const int64_t d01 = src0->ne[0] * src0->ne[1];
++    const int block = 256;
++    const int64_t grid = (n + block - 1) / block;
++    bias_lrelu_kernel<<<grid, block, 0, ctx.stream()>>>(
++        (const float *) src0->data, (const float *) src1->data,
++        (float *) dst->data, n, C, d01, axis, slope);
++}
++
++void ggml_cuda_op_subpix_lrelu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * g0 = dst->src[0];
++    const ggml_tensor * g1 = dst->src[1];
++    const ggml_tensor * bias = dst->src[2];
++    float slope;
++    memcpy(&slope, dst->op_params, sizeof(float));
++    const int W = (int) g0->ne[0];
++    const int H = (int) g0->ne[1];
++    const int OC = (int) (g0->ne[2] / 2);
++    const int64_t n = ggml_nelements(dst);
++    const int block = 256;
++    const int64_t grid = (n + block - 1) / block;
++    subpix_lrelu_kernel<<<grid, block, 0, ctx.stream()>>>(
++        (const float *) g0->data, (const float *) g1->data,
++        (const float *) bias->data, (float *) dst->data, n, W, H, OC, slope);
++}
+diff --git a/src/ggml-cuda/tp-fused.cuh b/src/ggml-cuda/tp-fused.cuh
+new file mode 100644
+index 00000000..95853046
+--- /dev/null
++++ b/src/ggml-cuda/tp-fused.cuh
+@@ -0,0 +1,4 @@
++#include "common.cuh"
++
++void ggml_cuda_op_bias_lrelu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++void ggml_cuda_op_subpix_lrelu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
-index 1b1150e7..47f5ee35 100644
+index 1b1150e7..e32d15ba 100644
 --- a/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/src/ggml-vulkan/ggml-vulkan.cpp
-@@ -899,6 +899,8 @@ struct vk_device_struct {
+@@ -899,6 +899,9 @@ struct vk_device_struct {
      std::map<vk_solve_tri_pipeline_state, vk_pipeline> pipeline_solve_tri_f32;
      vk_pipeline pipeline_im2col_f32, pipeline_im2col_f32_f16;
      vk_pipeline pipeline_im2col_3d_f32, pipeline_im2col_3d_f32_f16;
 +    vk_pipeline pipeline_im2col_cf_f32, pipeline_im2col_cf_f32_f16;
 +    vk_pipeline pipeline_bilinear_gather_f32, pipeline_bilinear_gather_f16_f32;
++    vk_pipeline pipeline_bias_lrelu_f32, pipeline_subpix_lrelu_f32;
      vk_pipeline pipeline_timestep_embedding_f32;
      vk_pipeline pipeline_conv_transpose_1d_f32;
      vk_pipeline pipeline_snake_f32;
-@@ -1525,6 +1527,29 @@ struct vk_op_timestep_embedding_push_constants {
+@@ -1525,6 +1528,45 @@ struct vk_op_timestep_embedding_push_constants {
      uint32_t max_period;
  };
  
@@ -486,10 +685,26 @@ index 1b1150e7..47f5ee35 100644
 +    uint32_t H;
 +};
 +
++struct vk_op_bias_lrelu_push_constants {
++    uint32_t n;
++    uint32_t C;
++    uint32_t d01;
++    uint32_t axis;
++    float slope;
++};
++
++struct vk_op_subpix_lrelu_push_constants {
++    uint32_t n;
++    uint32_t W;
++    uint32_t H;
++    uint32_t OC;
++    float slope;
++};
++
  struct vk_op_conv_transpose_1d_push_constants {
      uint32_t Cout;
      uint32_t Cin;
-@@ -5171,6 +5196,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+@@ -5171,6 +5213,15 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
          IM2COL()
      }
  
@@ -499,10 +714,13 @@ index 1b1150e7..47f5ee35 100644
 +    ggml_vk_create_pipeline(device, device->pipeline_bilinear_gather_f32, "bilinear_gather_f32", bilinear_gather_f32_len, bilinear_gather_f32_data, "main", 3, sizeof(vk_op_bilinear_gather_push_constants), {256, 1, 1}, {}, 1);
 +    ggml_vk_create_pipeline(device, device->pipeline_bilinear_gather_f16_f32, "bilinear_gather_f16_f32", bilinear_gather_f16_f32_len, bilinear_gather_f16_f32_data, "main", 3, sizeof(vk_op_bilinear_gather_push_constants), {256, 1, 1}, {}, 1);
 +
++    ggml_vk_create_pipeline(device, device->pipeline_bias_lrelu_f32, "bias_lrelu_f32", bias_lrelu_f32_len, bias_lrelu_f32_data, "main", 3, sizeof(vk_op_bias_lrelu_push_constants), {256, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_subpix_lrelu_f32, "subpix_lrelu_f32", subpix_lrelu_f32_len, subpix_lrelu_f32_data, "main", 4, sizeof(vk_op_subpix_lrelu_push_constants), {256, 1, 1}, {}, 1);
++
      ggml_vk_create_pipeline(device, device->pipeline_timestep_embedding_f32, "timestep_embedding_f32", timestep_embedding_f32_len, timestep_embedding_f32_data, "main", 2, sizeof(vk_op_timestep_embedding_push_constants), {256, 1, 1}, {}, 1);
  
      ggml_vk_create_pipeline(device, device->pipeline_conv_transpose_1d_f32, "conv_transpose_1d_f32", conv_transpose_1d_f32_len, conv_transpose_1d_f32_data, "main", 3, sizeof(vk_op_conv_transpose_1d_push_constants), {1, 1, 1}, {}, 1);
-@@ -10627,6 +10658,16 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const
+@@ -10627,6 +10678,16 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const
          }
          return nullptr;
      case GGML_OP_IM2COL:
@@ -519,7 +737,7 @@ index 1b1150e7..47f5ee35 100644
          if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
              return ctx->device->pipeline_im2col_f32;
          }
-@@ -10642,6 +10683,16 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const
+@@ -10642,6 +10703,26 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const
              return ctx->device->pipeline_im2col_3d_f32_f16;
          }
          return nullptr;
@@ -533,10 +751,20 @@ index 1b1150e7..47f5ee35 100644
 +            }
 +        }
 +        return nullptr;
++    case GGML_OP_BIAS_LRELU:
++        if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
++            return ctx->device->pipeline_bias_lrelu_f32;
++        }
++        return nullptr;
++    case GGML_OP_SUBPIX_LRELU:
++        if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
++            return ctx->device->pipeline_subpix_lrelu_f32;
++        }
++        return nullptr;
      case GGML_OP_TIMESTEP_EMBEDDING:
          if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
              return ctx->device->pipeline_timestep_embedding_f32;
-@@ -11030,6 +11081,13 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
+@@ -11030,6 +11111,13 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
          break;
      case GGML_OP_IM2COL:
          {
@@ -550,17 +778,19 @@ index 1b1150e7..47f5ee35 100644
              const bool is_2D = dst->op_params[6] == 1;
  
              const uint32_t IC = src1->ne[is_2D ? 2 : 1];
-@@ -11072,6 +11130,9 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
+@@ -11072,6 +11160,11 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
              elements = { IC_KD_KH_KW, OW, N_OD_OH };
              elements[2] = std::min(elements[2], ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
          } break;
 +    case GGML_OP_BILINEAR_GATHER:
++    case GGML_OP_BIAS_LRELU:
++    case GGML_OP_SUBPIX_LRELU:
 +        elements = { (uint32_t)ggml_nelements(dst), 1, 1 };
 +        break;
      case GGML_OP_TIMESTEP_EMBEDDING:
          {
              const uint32_t dim = dst->op_params[0];
-@@ -11226,8 +11287,10 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
+@@ -11226,8 +11319,10 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
          vk_subbuffer subbuf3 = use_src3 ? src3_buf : src0_buf;
          ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, subbuf2, dst_buf, subbuf3 }, pc, elements);
      } else if (op == GGML_OP_IM2COL || op == GGML_OP_IM2COL_3D) {
@@ -572,7 +802,7 @@ index 1b1150e7..47f5ee35 100644
              dst_buf.size = 1;
          }
          // im2col uses only src1 and dst buffers
-@@ -12723,6 +12786,22 @@ static void ggml_vk_im2col(ggml_backend_vk_context * ctx, vk_context& subctx, co
+@@ -12723,6 +12818,22 @@ static void ggml_vk_im2col(ggml_backend_vk_context * ctx, vk_context& subctx, co
      const int32_t d0 = dst->op_params[4];
      const int32_t d1 = dst->op_params[5];
  
@@ -595,7 +825,7 @@ index 1b1150e7..47f5ee35 100644
      const bool is_2D = dst->op_params[6] == 1;
  
      const uint32_t IC = src1->ne[is_2D ? 2 : 1];
-@@ -12755,6 +12834,14 @@ static void ggml_vk_im2col(ggml_backend_vk_context * ctx, vk_context& subctx, co
+@@ -12755,6 +12866,33 @@ static void ggml_vk_im2col(ggml_backend_vk_context * ctx, vk_context& subctx, co
      });
  }
  
@@ -607,10 +837,29 @@ index 1b1150e7..47f5ee35 100644
 +    });
 +}
 +
++static void ggml_vk_bias_lrelu(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++    const uint32_t axis = (uint32_t)((const int32_t *) dst->op_params)[0];
++    float slope;
++    memcpy(&slope, (const int32_t *) dst->op_params + 1, sizeof(float));
++    ggml_vk_op_f32<vk_op_bias_lrelu_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_BIAS_LRELU, {
++        (uint32_t)ggml_nelements(src0), (uint32_t)ggml_nelements(src1),
++        (uint32_t)(src0->ne[0] * src0->ne[1]), axis, slope
++    });
++}
++
++static void ggml_vk_subpix_lrelu(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, ggml_tensor * dst) {
++    float slope;
++    memcpy(&slope, dst->op_params, sizeof(float));
++    ggml_vk_op_f32<vk_op_subpix_lrelu_push_constants>(ctx, subctx, src0, src1, src2, nullptr, dst, GGML_OP_SUBPIX_LRELU, {
++        (uint32_t)ggml_nelements(dst), (uint32_t)src0->ne[0], (uint32_t)src0->ne[1],
++        (uint32_t)(src0->ne[2] / 2), slope
++    });
++}
++
  static void ggml_vk_im2col_3d(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      GGML_TENSOR_BINARY_OP_LOCALS
  
-@@ -14344,6 +14431,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+@@ -14344,6 +14482,18 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
      case GGML_OP_IM2COL_3D:
          ggml_vk_im2col_3d(ctx, compute_ctx, src0, src1, node);
  
@@ -618,10 +867,18 @@ index 1b1150e7..47f5ee35 100644
 +    case GGML_OP_BILINEAR_GATHER:
 +        ggml_vk_bilinear_gather(ctx, compute_ctx, src0, src1, node);
 +
++        break;
++    case GGML_OP_BIAS_LRELU:
++        ggml_vk_bias_lrelu(ctx, compute_ctx, src0, src1, node);
++
++        break;
++    case GGML_OP_SUBPIX_LRELU:
++        ggml_vk_subpix_lrelu(ctx, compute_ctx, src0, src1, node->src[2], node);
++
          break;
      case GGML_OP_TIMESTEP_EMBEDDING:
          ggml_vk_timestep_embedding(ctx, compute_ctx, src0, node);
-@@ -17041,6 +17132,12 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+@@ -17041,6 +17191,19 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
          case GGML_OP_IM2COL_3D:
              return op->src[1]->type == GGML_TYPE_F32
                  && (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16);
@@ -631,10 +888,17 @@ index 1b1150e7..47f5ee35 100644
 +                && op->type == GGML_TYPE_F32
 +                && ggml_is_contiguous(op->src[0])
 +                && ggml_is_contiguous(op->src[1]);
++        case GGML_OP_BIAS_LRELU:
++        case GGML_OP_SUBPIX_LRELU:
++            return op->src[0]->type == GGML_TYPE_F32
++                && op->src[1]->type == GGML_TYPE_F32
++                && op->type == GGML_TYPE_F32
++                && ggml_is_contiguous(op->src[0])
++                && ggml_is_contiguous(op->src[1]);
          case GGML_OP_TIMESTEP_EMBEDDING:
              return op->src[0]->type == GGML_TYPE_F32;
          case GGML_OP_CONV_2D_DW:
-@@ -17910,8 +18007,15 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
+@@ -17910,8 +18073,15 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
              const int32_t d0 = tensor->op_params[4];
              const int32_t d1 = tensor->op_params[5];
  
@@ -652,6 +916,46 @@ index 1b1150e7..47f5ee35 100644
          } else if (tensor->op == GGML_OP_IM2COL_3D) {
              const int32_t s0 = tensor->op_params[0];
              const int32_t s1 = tensor->op_params[1];
+diff --git a/src/ggml-vulkan/vulkan-shaders/bias_lrelu.comp b/src/ggml-vulkan/vulkan-shaders/bias_lrelu.comp
+new file mode 100644
+index 00000000..07179cce
+--- /dev/null
++++ b/src/ggml-vulkan/vulkan-shaders/bias_lrelu.comp
+@@ -0,0 +1,34 @@
++#version 450
++// fused y = leaky_relu(x + bias[c], slope); bias broadcast on axis 0
++// (c = i % C, channel-fastest layouts) or axis 2 (c = (i / d01) % C,
++// spatial [W,H,C] maps).
++//   binding 0: x    f32
++//   binding 1: bias f32 (C values)
++//   binding 2: y    f32
++
++#include "types.glsl"
++
++layout (push_constant) uniform parameter
++{
++    uint n;
++    uint C;
++    uint d01;
++    uint axis;
++    float slope;
++} p;
++
++layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
++
++layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
++layout (binding = 1) readonly buffer B {B_TYPE data_b[];};
++layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
++
++void main() {
++    const uint i = gl_GlobalInvocationID.x;
++    if (i >= p.n) {
++        return;
++    }
++    const uint c = p.axis == 0 ? i % p.C : (i / p.d01) % p.C;
++    const float v = float(data_a[i]) + float(data_b[c]);
++    data_d[i] = D_TYPE(v > 0.0f ? v : p.slope * v);
++}
 diff --git a/src/ggml-vulkan/vulkan-shaders/bilinear_gather.comp b/src/ggml-vulkan/vulkan-shaders/bilinear_gather.comp
 new file mode 100644
 index 00000000..8a788fab
@@ -774,11 +1078,56 @@ index 00000000..c39591a0
 +        data_d[base + r] = D_TYPE(v);
 +    }
 +}
+diff --git a/src/ggml-vulkan/vulkan-shaders/subpix_lrelu.comp b/src/ggml-vulkan/vulkan-shaders/subpix_lrelu.comp
+new file mode 100644
+index 00000000..66228369
+--- /dev/null
++++ b/src/ggml-vulkan/vulkan-shaders/subpix_lrelu.comp
+@@ -0,0 +1,39 @@
++#version 450
++// fused 2x2 sub-pixel interleave + bias + leaky_relu over two parity group
++// maps g0 (by=0) / g1 (by=1), each [W, H, 2*OC] with channel q = bx*OC + o:
++//   dst[2n+bx, 2m+by, o] = lrelu(g{by}[n, m, o + OC*bx] + bias[o])
++//   binding 0: g0   f32
++//   binding 1: g1   f32
++//   binding 2: bias f32 (OC values)
++//   binding 3: dst  f32 [2W, 2H, OC]
++
++#include "types.glsl"
++
++layout (push_constant) uniform parameter
++{
++    uint n;
++    uint W;
++    uint H;
++    uint OC;
++    float slope;
++} p;
++
++layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
++
++layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
++layout (binding = 1) readonly buffer B {B_TYPE data_b[];};
++layout (binding = 2) readonly buffer C {FLOAT_TYPE data_c[];};
++layout (binding = 3) writeonly buffer D {D_TYPE data_d[];};
++
++void main() {
++    const uint i = gl_GlobalInvocationID.x;
++    if (i >= p.n) {
++        return;
++    }
++    const uint xx = i % (2u * p.W);
++    const uint yy = (i / (2u * p.W)) % (2u * p.H);
++    const uint o  = i / (4u * p.W * p.H);
++    const uint s  = (xx >> 1) + p.W * ((yy >> 1) + p.H * (o + p.OC * (xx & 1u)));
++    const float v = ((yy & 1u) == 1u ? float(data_b[s]) : float(data_a[s])) + float(data_c[o]);
++    data_d[i] = D_TYPE(v > 0.0f ? v : p.slope * v);
++}
 diff --git a/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
-index 7bcb1460..2046ec9c 100644
+index 7bcb1460..0141ffce 100644
 --- a/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
 +++ b/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
-@@ -997,6 +997,12 @@ void process_shaders() {
+@@ -997,6 +997,15 @@ void process_shaders() {
          }
      }
  
@@ -788,39 +1137,46 @@ index 7bcb1460..2046ec9c 100644
 +    string_to_spv("bilinear_gather_f32", "bilinear_gather.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
 +    string_to_spv("bilinear_gather_f16_f32", "bilinear_gather.comp", merge_maps(base_dict, {{"A_TYPE", "float16_t"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
 +
++    string_to_spv("bias_lrelu_f32", "bias_lrelu.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
++    string_to_spv("subpix_lrelu_f32", "subpix_lrelu.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"D_TYPE", "float"}}));
++
      string_to_spv("timestep_embedding_f32", "timestep_embedding.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
  
      string_to_spv("conv_transpose_1d_f32", "conv_transpose_1d.comp", {{"A_TYPE", "float"},  {"B_TYPE", "float"}, {"D_TYPE", "float"}});
 diff --git a/src/ggml.c b/src/ggml.c
-index b43016c8..67059eb9 100644
+index b43016c8..a79eb268 100644
 --- a/src/ggml.c
 +++ b/src/ggml.c
-@@ -1079,9 +1079,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+@@ -1079,9 +1079,13 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
      "OPT_STEP_SGD",
  
      "GLU",
 +
 +    "BILINEAR_GATHER",
++    "BIAS_LRELU",
++    "SUBPIX_LRELU",
  };
  
 -static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
-+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
++static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
  
  static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
      "none",
-@@ -1190,9 +1192,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+@@ -1190,9 +1194,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
      "sgd(x)",
  
      "glu(x)",
 +    "bilinear_gather(x)",
++    "bias_lrelu(x)",
++    "subpix_lrelu(x)",
  };
  
 -static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
-+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
++static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
  
  static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
  
-@@ -4482,6 +4485,64 @@ struct ggml_tensor * ggml_im2col_back(
+@@ -4482,6 +4489,116 @@ struct ggml_tensor * ggml_im2col_back(
  
  // ggml_conv_1d
  
@@ -878,6 +1234,58 @@ index b43016c8..67059eb9 100644
 +    result->op     = GGML_OP_BILINEAR_GATHER;
 +    result->src[0] = a;
 +    result->src[1] = b;
++
++    return result;
++}
++
++struct ggml_tensor * ggml_bias_lrelu(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * x,
++        struct ggml_tensor  * bias,
++        int                   axis,
++        float                 slope) {
++    GGML_ASSERT(x->type == GGML_TYPE_F32 && bias->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(bias));
++    GGML_ASSERT(axis == 0 || axis == 2);
++    GGML_ASSERT(ggml_nelements(bias) == x->ne[axis]);
++
++    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, x->ne);
++    int32_t params[2] = { axis, 0 };
++    memcpy(&params[1], &slope, sizeof(float));
++    ggml_set_op_params(result, params, sizeof(params));
++
++    result->op     = GGML_OP_BIAS_LRELU;
++    result->src[0] = x;
++    result->src[1] = bias;
++
++    return result;
++}
++
++struct ggml_tensor * ggml_subpix_lrelu(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * g0,
++        struct ggml_tensor  * g1,
++        struct ggml_tensor  * bias,
++        float                 slope) {
++    GGML_ASSERT(g0->type == GGML_TYPE_F32 && g1->type == GGML_TYPE_F32);
++    GGML_ASSERT(bias->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(g0) && ggml_is_contiguous(g1) && ggml_is_contiguous(bias));
++    GGML_ASSERT(ggml_are_same_shape(g0, g1));
++    GGML_ASSERT(g0->ne[3] == 1);
++    GGML_ASSERT(g0->ne[2] % 2 == 0);
++    const int64_t OC = g0->ne[2] / 2;
++    GGML_ASSERT(ggml_nelements(bias) == OC);
++
++    const int64_t ne[4] = { 2 * g0->ne[0], 2 * g0->ne[1], OC, 1 };
++    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
++    int32_t params[1];
++    memcpy(&params[0], &slope, sizeof(float));
++    ggml_set_op_params(result, params, sizeof(params));
++
++    result->op     = GGML_OP_SUBPIX_LRELU;
++    result->src[0] = g0;
++    result->src[1] = g1;
++    result->src[2] = bias;
 +
 +    return result;
 +}

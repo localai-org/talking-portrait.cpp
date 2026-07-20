@@ -239,6 +239,7 @@ struct mdec_build {
     std::map<std::string, ggml_tensor *> &derived;
     ggml_tensor *latent = nullptr;  // [512, B]
     ggml_tensor *one = nullptr;     // [1, B] const 1.0
+    bool fused = true;              // use the fused bias/lrelu/subpix ops
     std::string err;
 
     // Dataflow is CHANNEL-LAST ([C, N, Bc] GEMM outputs); spatial
@@ -302,8 +303,14 @@ struct mdec_build {
     }
     // FusedLeakyReLU on channel-last (sqrt2 folded upstream); ab [1,1,C,1]
     ggml_tensor *bias_lrelu_cl(ggml_tensor *y_cl, ggml_tensor *ab) {
+        if (fused) return ggml_bias_lrelu(ctx, y_cl, ab, 0, 0.2f);
         y_cl = ggml_add(ctx, y_cl, ggml_reshape_2d(ctx, ab, ab->ne[2], 1));
         return ggml_leaky_relu(ctx, y_cl, 0.2f, false);
+    }
+    // same on spatial [W,H,C,Bc] maps
+    ggml_tensor *bias_lrelu_sp(ggml_tensor *y_sp, ggml_tensor *ab) {
+        if (fused) return ggml_bias_lrelu(ctx, y_sp, ab, 2, 0.2f);
+        return fused_lrelu(ctx, y_sp, ab);
     }
     // weight-side folding pays off only when the map is larger than the
     // weight matrix (big resolutions); small stages modulate the map
@@ -461,7 +468,7 @@ struct mdec_build {
         if (!W || !ab || !style || !den) return nullptr;
         ggml_tensor *Wf = fold_w4(W, bstyle(style, c, 1), bstyle(den, c, 1), false);
         ggml_tensor *y = ggml_conv_2d_direct(ctx, Wf, x_sp, 1, 1, 1, 1, 1, 1);
-        return fused_lrelu(ctx, y, ab);
+        return bias_lrelu_sp(y, ab);
     }
     // modulated up conv, spatial: composed sub-pixel kernel (blur folded in)
     // as one 3x3 pad-1 conv producing 4 parity classes on the channel dim,
@@ -490,6 +497,19 @@ struct mdec_build {
         const int64_t W = x_sp->ne[0], H = x_sp->ne[1];
         // per-parity denominator: channel q = k*OC + o, q % OC = o -> tile
         ggml_tensor *den4 = ggml_repeat_4d(ctx, dn, 4 * OC, 1, 1, 1);
+        if (fused && !getenv("TP_MDEC_UPSP_MAPSIDE") && !getenv("TP_MDEC_UPSP_CLCONV")) {
+            // two half convs (one per row parity; wide-Cout CONV_2D corrupts
+            // on this driver) + fused interleave/bias/lrelu
+            ggml_tensor *Wf = fold_w4(Ts, sty, den4, false);  // [3,3,IC,4OC]
+            ggml_tensor *grp[2];
+            for (int g = 0; g < 2; g++) {
+                ggml_tensor *Wk = ggml_view_4d(ctx, Wf, Wf->ne[0], Wf->ne[1], Wf->ne[2],
+                                               2 * OC, Wf->nb[1], Wf->nb[2], Wf->nb[3],
+                                               (size_t) g * 2 * OC * Wf->nb[3]);
+                grp[g] = ggml_conv_2d_direct(ctx, Wk, x_sp, 1, 1, 1, 1, 1, 1);
+            }
+            return ggml_subpix_lrelu(ctx, grp[0], grp[1], ab, 0.2f);
+        }
         ggml_tensor *y4;
         if (getenv("TP_MDEC_UPSP_MAPSIDE")) {
             // debug: modulate the map, conv with the leaf weight tensor
@@ -516,14 +536,36 @@ struct mdec_build {
                 cls[k] = ggml_cont(ctx, ggml_view_3d(ctx, y4, W, H, OC, y4->nb[1],
                                                      y4->nb[2], (size_t) k * OC * y4->nb[2]));
         } else {
-            // one conv per parity class: keeps Cout small (the wide-Cout
-            // CONV_2D shapes corrupt on this driver, cf. docs/vulkan-perf.md)
+            // split the 4-class conv: wide-Cout CONV_2D shapes corrupt on
+            // this driver (cf. docs/vulkan-perf.md). TP_MDEC_UPSPLIT sets
+            // convs per up (1|2|4), csv per spatial stage from stage 5.
+            int nsplit = 4;
+            if (const char *e = getenv("TP_MDEC_UPSPLIT")) {
+                // pick the entry matching this stage's OC (64->j6:2nd, ...)
+                int v1 = 4, v2 = 4;
+                sscanf(e, "%d,%d", &v1, &v2);
+                nsplit = (x_sp->ne[2] == 64) ? v2 : v1;  // IC 64 = stage 6
+                if (nsplit != 1 && nsplit != 2) nsplit = 4;
+            }
             ggml_tensor *Wf = fold_w4(Ts, sty, den4, false);  // [3,3,IC,4OC]
-            for (int k = 0; k < 4; k++) {
+            const int64_t OCg = 4 * OC / nsplit;
+            ggml_tensor *grp[4];
+            for (int g = 0; g < nsplit; g++) {
                 ggml_tensor *Wk = ggml_view_4d(ctx, Wf, Wf->ne[0], Wf->ne[1], Wf->ne[2],
-                                               OC, Wf->nb[1], Wf->nb[2], Wf->nb[3],
-                                               (size_t) k * OC * Wf->nb[3]);
-                cls[k] = ggml_conv_2d_direct(ctx, Wk, x_sp, 1, 1, 1, 1, 1, 1);
+                                               OCg, Wf->nb[1], Wf->nb[2], Wf->nb[3],
+                                               (size_t) g * OCg * Wf->nb[3]);
+                grp[g] = ggml_conv_2d_direct(ctx, Wk, x_sp, 1, 1, 1, 1, 1, 1);
+            }
+            const int64_t per = 4 / nsplit;  // classes per group
+            for (int k = 0; k < 4; k++) {
+                ggml_tensor *gt = grp[k / per];
+                if (per == 1) {
+                    cls[k] = gt;
+                } else {
+                    cls[k] = ggml_cont(
+                        ctx, ggml_view_3d(ctx, gt, W, H, OC, gt->nb[1], gt->nb[2],
+                                          (size_t) (k % per) * OC * gt->nb[2]));
+                }
             }
         }
         ggml_tensor *E[2];
@@ -688,6 +730,7 @@ bool motion_dec::build(backend_t &be, bool with_taps, std::string &err) {
     p.begin(4096);
     ggml_context *ctx = p.ctx;
     mdec_build B{p, ctx, w, derived};
+    B.fused = !exact_graph && getenv("TP_MDEC_NOFUSED") == nullptr;
 
     B.latent = p.input("style", ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 512, bsz));
     B.one = ggml_view_2d(ctx, onec, 1, bsz, onec->nb[1], 0);
@@ -841,13 +884,13 @@ bool motion_dec::build(backend_t &be, bool with_taps, std::string &err) {
 
         // stages >= spatial_from use the spatial direct-conv path (chunk 1);
         // env TP_MDEC_SPATIAL overrides (7 = none)
-        int spatial_from = 5;
+        int spatial_from = 4;
         if (const char *e = getenv("TP_MDEC_SPATIAL")) {
             spatial_from = atoi(e);
             if (spatial_from < 0 || spatial_from > 7) spatial_from = 7;
         }
         // per-stage batch caps (peak-VRAM guard); env TP_MDEC_BMAX=csv, 0=full
-        int64_t cap[7] = {bsz, bsz, bsz, bsz, bsz,
+        int64_t cap[7] = {bsz, bsz, bsz, std::min<int64_t>(bsz, 4), bsz,
                           std::min<int64_t>(bsz, 2), std::min<int64_t>(bsz, 1)};
         if (const char *e = getenv("TP_MDEC_BMAX")) {
             char tmp[128];
@@ -953,7 +996,7 @@ bool motion_dec::build(backend_t &be, bool with_taps, std::string &err) {
 
                     // ToRGB: 1x1 EqualConv2d direct
                     ggml_tensor *rgb = ggml_conv_2d_direct(ctx, rW, warp, 1, 1, 0, 0, 1, 1);
-                    rgb = fused_lrelu(ctx, rgb, rlb);
+                    rgb = B.bias_lrelu_sp(rgb, rlb);
                     rgb = ggml_add(ctx, rgb, rbias);
                     if (!sk.t.empty())
                         rgb = ggml_add(ctx, rgb,
