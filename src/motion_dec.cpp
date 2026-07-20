@@ -32,7 +32,7 @@ bool motion_dec::prepare(backend_t &be, std::string &err) {
     // derived: S_aug demod matrices for all 15 demod convs, spatially
     // flipped weights for the 7 upsample convs
     ggml_init_params cp = {
-        /*mem_size  =*/ ggml_tensor_overhead() * 64,
+        /*mem_size  =*/ ggml_tensor_overhead() * 96,
         /*mem_buffer=*/ nullptr,
         /*no_alloc  =*/ true,
     };
@@ -74,6 +74,16 @@ bool motion_dec::prepare(backend_t &be, std::string &err) {
             ggml_tensor *wf = ggml_new_tensor_4d(dctx, GGML_TYPE_F32, 3, 3, jb.ic, jb.oc);
             ggml_set_name(wf, ("wflip." + jb.name).c_str());
             derived["wflip." + jb.name] = wf;
+            // conv_transpose layout [KW, KH, OC, IC] for the spatial
+            // direct-conv path (GGML_OP_CONV_TRANSPOSE_2D)
+            ggml_tensor *tc = ggml_new_tensor_4d(dctx, wt, 3, 3, jb.oc, jb.ic);
+            ggml_set_name(tc, ("tconv." + jb.name).c_str());
+            derived["tconv." + jb.name] = tc;
+            // sub-pixel composed kernel in spatial conv layout [3,3,IC,4OC]
+            // (blur pre-composed; output needs the parity pixel-shuffle)
+            ggml_tensor *tsp = ggml_new_tensor_4d(dctx, wt, 3, 3, jb.ic, 4 * jb.oc);
+            ggml_set_name(tsp, ("tsubsp." + jb.name).c_str());
+            derived["tsubsp." + jb.name] = tsp;
         } else if (jb.name != "dec.conv1.conv.weight") {
             // cf-ordered GEMM matrix for the dense 3x3 convs
             ggml_tensor *ac = ggml_new_tensor_2d(dctx, wt, (int64_t) jb.ic * 9, jb.oc);
@@ -179,6 +189,28 @@ bool motion_dec::prepare(backend_t &be, std::string &err) {
                 }
             }
             upload(derived["tsubcf." + jb.name], tb);
+            // spatial layout of the same composed kernel: tsubsp[(q*3+kh)*3+kw
+            // + ...] i.e. ggml [3,3,IC,4OC] index (kw,kh,i,q) = tb[q*R + i +
+            // IC*(kw + 3*kh)]
+            {
+                std::vector<float> tsp((size_t) R * 4 * OC);
+                for (int q = 0; q < 4 * OC; q++)
+                    for (int i = 0; i < IC; i++)
+                        for (int kh = 0; kh < 3; kh++)
+                            for (int kw = 0; kw < 3; kw++)
+                                tsp[(((size_t) q * IC + i) * 3 + kh) * 3 + kw] =
+                                    tb[(size_t) q * R + i + (size_t) IC * (kw + 3 * kh)];
+                upload(derived["tsubsp." + jb.name], tsp);
+            }
+            // tconv[kw + 3kh + 9(o + OC i)] = W[o][i][kh][kw]
+            std::vector<float> tc((size_t) IC * OC * 9);
+            for (int o = 0; o < OC; o++)
+                for (int i = 0; i < IC; i++)
+                    for (int kh = 0; kh < 3; kh++)
+                        for (int kw = 0; kw < 3; kw++)
+                            tc[(size_t) 9 * (o + (size_t) OC * i) + kh * 3 + kw] =
+                                W[((size_t) o * IC + i) * 9 + kh * 3 + kw];
+            upload(derived["tconv." + jb.name], tc);
             std::vector<float> fb(W.size());
             for (int o = 0; o < OC; o++)
                 for (int i = 0; i < IC; i++)
@@ -303,8 +335,14 @@ struct mdec_build {
         ggml_tensor *x4 = ggml_reshape_4d(ctx, x_cl, IC, W, H, Bc);
         ggml_tensor *shape4 = ggml_reshape_4d(ctx, A2, 3, 3, IC, A2->ne[1]);  // dims only
         ggml_tensor *im = ggml_im2col_cf(ctx, shape4, x4, 1, 1, pad, pad, 1, 1, A2->type);
-        return ggml_mul_mat(
-            ctx, Af, ggml_reshape_3d(ctx, im, im->ne[0], im->ne[1] * im->ne[2], Bc));
+        const int64_t N = im->ne[1] * im->ne[2];
+        if (Af == A2 && Bc > 1) {
+            // shared weight: flatten the batch into the GEMM N dim so the
+            // A-matrix is streamed once, not once per batch element
+            ggml_tensor *y = ggml_mul_mat(ctx, Af, ggml_reshape_2d(ctx, im, im->ne[0], N * Bc));
+            return ggml_reshape_3d(ctx, y, y->ne[0], N, Bc);
+        }
+        return ggml_mul_mat(ctx, Af, ggml_reshape_3d(ctx, im, im->ne[0], N, Bc));
     }
     // normal modulated conv 3x3 (demodulate) + FLReLU: CL in, CL out.
     // style/den are full-batch [., B]; c/Bc select the chunk.
@@ -338,8 +376,10 @@ struct mdec_build {
         ggml_tensor *xs = ggml_mul(ctx, x, ggml_reshape_4d(ctx, style, 1, 1, C, Bb));
         ggml_tensor *im = ggml_im2col(ctx, W, xs, 1, 1, 1, 1, 1, 1, true, W->type);
         ggml_tensor *Am = ggml_reshape_2d(ctx, W, W->ne[0] * W->ne[1] * W->ne[2], W->ne[3]);
-        ggml_tensor *y = ggml_mul_mat(
-            ctx, Am, ggml_reshape_3d(ctx, im, im->ne[0], im->ne[1] * im->ne[2], Bb));
+        const int64_t NN = im->ne[1] * im->ne[2];
+        // shared weight: flatten batch into the GEMM N dim (stream A once)
+        ggml_tensor *y = ggml_mul_mat(ctx, Am, ggml_reshape_2d(ctx, im, im->ne[0], NN * Bb));
+        y = ggml_reshape_3d(ctx, y, y->ne[0], NN, Bb);
         y = ggml_div(ctx, y, ggml_reshape_3d(ctx, den, den->ne[0], 1, Bb));
         return bias_lrelu_cl(y, ab);  // [OC, 16, B]
     }
@@ -389,6 +429,113 @@ struct mdec_build {
         zs = ggml_pad_ext(ctx, zs, 2, 1, 2, 1, 0, 0, 0, 0);
         ggml_tensor *k4 = ggml_repeat_4d(ctx, ggml_reshape_4d(ctx, kern, 4, 4, 1, 1), 4, 4, 1, C);
         return ggml_conv_2d_dw_direct(ctx, k4, zs, 1, 1, 0, 0, 1, 1);
+    }
+    // ---- spatial direct-conv fast-stage variants (big maps): implicit-GEMM
+    // CONV_2D / CONV_TRANSPOSE_2D, style+den folded into the (tiny) conv
+    // weights per frame — no im2col materialization, no full-map style/den
+    // passes. Chunk size is 1 (weights are per frame). ----
+    // W4 [KW,KH,IC,OC] (conv) or [KW,KH,OC,IC] (conv_transpose, tl=true).
+    // The folded weight is cast back to the source dtype: the f16 weight
+    // path keeps CONV_2D on the (coopmat2-staged) f16 pipelines — the f32
+    // conv2d pipeline corrupts some shapes here (see docs/vulkan-perf.md).
+    ggml_tensor *fold_w4(ggml_tensor *W4, ggml_tensor *style, ggml_tensor *den, bool tl) {
+        const ggml_type t0 = W4->type;
+        ggml_tensor *Wf = t0 == GGML_TYPE_F32 ? W4 : ggml_cast(ctx, W4, GGML_TYPE_F32);
+        if (style) {
+            ggml_tensor *s4 = tl ? ggml_reshape_4d(ctx, style, 1, 1, 1, style->ne[0])
+                                 : ggml_reshape_4d(ctx, style, 1, 1, style->ne[0], 1);
+            Wf = ggml_mul(ctx, Wf, s4);
+        }
+        if (den) {
+            ggml_tensor *d4 = tl ? ggml_reshape_4d(ctx, den, 1, 1, den->ne[0], 1)
+                                 : ggml_reshape_4d(ctx, den, 1, 1, 1, den->ne[0]);
+            Wf = ggml_div(ctx, Wf, d4);
+        }
+        return t0 == GGML_TYPE_F32 ? Wf : ggml_cast(ctx, Wf, t0);
+    }
+    // modulated 3x3 conv (demodulate) + FLReLU, spatial in/out, frame c
+    ggml_tensor *styled_conv_sp(ggml_tensor *x_sp, const std::string &base,
+                                ggml_tensor *style, ggml_tensor *den, int64_t c) {
+        ggml_tensor *W = need(base + ".conv.weight");
+        ggml_tensor *ab = need(base + ".activate.bias");
+        if (!W || !ab || !style || !den) return nullptr;
+        ggml_tensor *Wf = fold_w4(W, bstyle(style, c, 1), bstyle(den, c, 1), false);
+        ggml_tensor *y = ggml_conv_2d_direct(ctx, Wf, x_sp, 1, 1, 1, 1, 1, 1);
+        return fused_lrelu(ctx, y, ab);
+    }
+    // modulated up conv, spatial: composed sub-pixel kernel (blur folded in)
+    // as one 3x3 pad-1 conv producing 4 parity classes on the channel dim,
+    // then a spatial pixel-shuffle. Frame c (chunk size 1).
+    ggml_tensor *styled_conv_up_sp(ggml_tensor *x_sp, const std::string &base,
+                                   ggml_tensor *style, ggml_tensor *den, int64_t c) {
+        ggml_tensor *ab = need(base + ".activate.bias");
+        if (!ab || !style || !den) return nullptr;
+        ggml_tensor *sty = bstyle(style, c, 1), *dn = bstyle(den, c, 1);
+        if (getenv("TP_MDEC_UPSP_TCONV")) {
+            // A/B variant: conv_transpose + separate blur pass
+            ggml_tensor *Tc = der("tconv." + base + ".conv.weight");
+            ggml_tensor *kb = need(base + ".conv.blur.kernel");
+            if (!Tc || !kb) return nullptr;
+            const int OC = (int) Tc->ne[2];
+            ggml_tensor *Wf = fold_w4(Tc, sty, dn, true);
+            ggml_tensor *y = ggml_conv_transpose_2d_p0(ctx, Wf, x_sp, 2);
+            ggml_tensor *k4 =
+                ggml_repeat_4d(ctx, ggml_reshape_4d(ctx, kb, 4, 4, 1, 1), 4, 4, 1, OC);
+            y = blur(ctx, y, k4, 1, 1);  // [2W, 2H, OC]
+            return fused_lrelu(ctx, y, ab);
+        }
+        ggml_tensor *Ts = der("tsubsp." + base + ".conv.weight");
+        if (!Ts) return nullptr;
+        const int64_t OC = Ts->ne[3] / 4;
+        const int64_t W = x_sp->ne[0], H = x_sp->ne[1];
+        // per-parity denominator: channel q = k*OC + o, q % OC = o -> tile
+        ggml_tensor *den4 = ggml_repeat_4d(ctx, dn, 4 * OC, 1, 1, 1);
+        ggml_tensor *y4;
+        if (getenv("TP_MDEC_UPSP_MAPSIDE")) {
+            // debug: modulate the map, conv with the leaf weight tensor
+            ggml_tensor *xs = ggml_mul(
+                ctx, x_sp, ggml_reshape_4d(ctx, sty, 1, 1, sty->ne[0], 1));
+            y4 = ggml_conv_2d_direct(ctx, Ts, xs, 1, 1, 1, 1, 1, 1);
+            y4 = ggml_div(ctx, y4, ggml_reshape_4d(ctx, den4, 1, 1, 4 * OC, 1));
+        } else if (getenv("TP_MDEC_UPSP_CLCONV")) {
+            // debug: conv via the CL im2col+GEMM path, then to spatial
+            ggml_tensor *Tcf = der("tsubcf." + base + ".conv.weight");
+            if (!Tcf) return nullptr;
+            ggml_tensor *x_cl3 = ggml_reshape_3d(
+                ctx, ggml_cont(ctx, ggml_permute(ctx, x_sp, 1, 2, 0, 3)),
+                x_sp->ne[2], W * H, 1);
+            ggml_tensor *y_cl = conv_cf(Tcf, fold_A(Tcf, sty, den4), x_cl3, W, H, 1);
+            y4 = cl_to_sp(y_cl, W, H);  // [W, H, 4OC, 1]
+        } else {
+            y4 = nullptr;  // per-class convs below (see cls)
+        }
+        // pixel shuffle: out[2n+bx, 2m+by, o] = class k = 2by+bx at [n, m, o]
+        ggml_tensor *cls[4];
+        if (y4) {
+            for (int k = 0; k < 4; k++)
+                cls[k] = ggml_cont(ctx, ggml_view_3d(ctx, y4, W, H, OC, y4->nb[1],
+                                                     y4->nb[2], (size_t) k * OC * y4->nb[2]));
+        } else {
+            // one conv per parity class: keeps Cout small (the wide-Cout
+            // CONV_2D shapes corrupt on this driver, cf. docs/vulkan-perf.md)
+            ggml_tensor *Wf = fold_w4(Ts, sty, den4, false);  // [3,3,IC,4OC]
+            for (int k = 0; k < 4; k++) {
+                ggml_tensor *Wk = ggml_view_4d(ctx, Wf, Wf->ne[0], Wf->ne[1], Wf->ne[2],
+                                               OC, Wf->nb[1], Wf->nb[2], Wf->nb[3],
+                                               (size_t) k * OC * Wf->nb[3]);
+                cls[k] = ggml_conv_2d_direct(ctx, Wk, x_sp, 1, 1, 1, 1, 1, 1);
+            }
+        }
+        ggml_tensor *E[2];
+        for (int by = 0; by < 2; by++) {
+            ggml_tensor *a = ggml_reshape_4d(ctx, cls[by * 2 + 0], 1, W, H, OC);
+            ggml_tensor *b = ggml_reshape_4d(ctx, cls[by * 2 + 1], 1, W, H, OC);
+            E[by] = ggml_reshape_3d(ctx, ggml_concat(ctx, a, b, 0), 2 * W, H, OC);
+        }
+        ggml_tensor *F = ggml_concat(ctx, ggml_reshape_4d(ctx, E[0], 2 * W, 1, H, OC),
+                                     ggml_reshape_4d(ctx, E[1], 2 * W, 1, H, OC), 1);
+        F = ggml_reshape_4d(ctx, F, 2 * W, 2 * H, OC, 1);
+        return fused_lrelu(ctx, F, ab);
     }
     // ---- numerically-conservative (parity) variants: spatial layout,
     // direct convolution kernels, map-side modulation ----
@@ -692,6 +839,13 @@ bool motion_dec::build(backend_t &be, bool with_taps, std::string &err) {
                                                (size_t) chn * fl->nb[2]));
         };
 
+        // stages >= spatial_from use the spatial direct-conv path (chunk 1);
+        // env TP_MDEC_SPATIAL overrides (7 = none)
+        int spatial_from = 5;
+        if (const char *e = getenv("TP_MDEC_SPATIAL")) {
+            spatial_from = atoi(e);
+            if (spatial_from < 0 || spatial_from > 7) spatial_from = 7;
+        }
         // per-stage batch caps (peak-VRAM guard); env TP_MDEC_BMAX=csv, 0=full
         int64_t cap[7] = {bsz, bsz, bsz, bsz, bsz,
                           std::min<int64_t>(bsz, 2), std::min<int64_t>(bsz, 1)};
@@ -707,6 +861,7 @@ bool motion_dec::build(backend_t &be, bool with_taps, std::string &err) {
             }
         }
         for (int j = 0; j < 7; j++) {
+            if (j >= spatial_from) cap[j] = 1;  // per-frame folded weights
             if (cap[j] > bsz) cap[j] = bsz;
             while (cap[j] > 1 && bsz % cap[j]) cap[j]--;   // must divide bsz
             if (j > 0 && cap[j] > cap[j - 1]) cap[j] = cap[j - 1];  // monotone
@@ -722,7 +877,8 @@ bool motion_dec::build(backend_t &be, bool with_taps, std::string &err) {
             err = B.err.empty() ? "conv1 failed" : B.err;
             return false;
         }
-        bchunks x{{x0}, bsz};    // trunk, CL [C, N, bc]
+        bchunks x{{x0}, bsz};    // trunk, CL [C, N, bc] (or spatial)
+        bool x_is_sp = false;    // trunk layout: CL vs spatial [W,H,C,bc]
         bchunks sk{{}, bsz};     // rgb accumulator, spatial [r, r, 3, bc]
         bchunks skf{{}, bsz};    // flow accumulator, spatial [r, r, 3, bc]
 
@@ -756,8 +912,55 @@ bool motion_dec::build(backend_t &be, bool with_taps, std::string &err) {
                 return false;
             }
 
+            const bool spatial = j >= spatial_from;
             bchunks xn{{}, Bc}, skn{{}, Bc}, sfn{{}, Bc};
             for (int64_t c = 0; c < nch; c++) {
+                ggml_tensor *fl, *m;
+                if (spatial) {
+                    // ---- spatial direct-conv stage (Bc == 1) ----
+                    ggml_tensor *x_c = x_is_sp
+                        ? sp_slice(x, c, 1)
+                        : B.cl_to_sp(cl_slice(x, c, 1), r / 2, r / 2);
+                    ggml_tensor *c1 = B.styled_conv_up_sp(x_c, b1, s1, d1, c);
+                    ggml_tensor *out =
+                        c1 ? B.styled_conv_sp(c1, b2, s2, d2, c) : nullptr;
+                    if (!out) {
+                        err = B.err;
+                        return false;
+                    }
+                    // ToFlow: 1x1 modulated conv, weight-folded
+                    ggml_tensor *fWf =
+                        B.fold_w4(fW, B.bstyle(fstyle, c, 1), nullptr, false);
+                    fl = ggml_conv_2d_direct(ctx, fWf, out, 1, 1, 0, 0, 1, 1);
+                    fl = ggml_add(ctx, fl, fbias);
+                    if (!skf.t.empty())
+                        fl = ggml_add(ctx, fl,
+                                      B.upsample2x(sp_slice(skf, c, 1), fup, masks[j]));
+                    sfn.t.push_back(fl);
+
+                    ggml_tensor *gx = ggml_add(ctx, ggml_tanh(ctx, flch(fl, 0)), xs_x[j]);
+                    ggml_tensor *gy = ggml_add(ctx, ggml_tanh(ctx, flch(fl, 1)), xs_y[j]);
+                    m = ggml_sigmoid(ctx, flch(fl, 2));  // [r,r,1]
+                    ggml_tensor *m4 = ggml_reshape_4d(ctx, m, r, r, 1, 1);
+                    ggml_tensor *sampled_sp = B.cl_to_sp(
+                        B.grid_sample_cl(feats[j], gx, gy, r), r, r);  // [r,r,C,1]
+                    ggml_tensor *warp = ggml_mul(ctx, sampled_sp, m4);
+                    ggml_tensor *one_m = ggml_reshape_4d(
+                        ctx, ggml_scale_bias(ctx, m, -1.0f, 1.0f), r, r, 1, 1);
+                    ggml_tensor *trunk =
+                        ggml_add(ctx, warp, ggml_mul(ctx, out, one_m));
+                    xn.t.push_back(trunk);
+
+                    // ToRGB: 1x1 EqualConv2d direct
+                    ggml_tensor *rgb = ggml_conv_2d_direct(ctx, rW, warp, 1, 1, 0, 0, 1, 1);
+                    rgb = fused_lrelu(ctx, rgb, rlb);
+                    rgb = ggml_add(ctx, rgb, rbias);
+                    if (!sk.t.empty())
+                        rgb = ggml_add(ctx, rgb,
+                                       B.upsample2x(sp_slice(sk, c, 1), rup, masks[j]));
+                    skn.t.push_back(rgb);
+                    continue;
+                }
                 ggml_tensor *x_c = cl_slice(x, c, Bc);
                 ggml_tensor *c1_cl =
                     B.styled_conv_up(x_c, r / 2, r / 2, b1, s1, d1, c, Bc);  // [OC,N,Bc]
@@ -772,7 +975,7 @@ bool motion_dec::build(backend_t &be, bool with_taps, std::string &err) {
                 ggml_tensor *fl_cl = ggml_mul_mat(
                     ctx, B.gemm_weight(fW, B.bstyle(fstyle, c, Bc), nullptr), out_cl);
                 fl_cl = ggml_add(ctx, fl_cl, ggml_reshape_2d(ctx, fbias, 3, 1));
-                ggml_tensor *fl = B.cl_to_sp(fl_cl, r, r);  // [r,r,3,Bc]
+                fl = B.cl_to_sp(fl_cl, r, r);  // [r,r,3,Bc]
                 if (!skf.t.empty())
                     fl = ggml_add(ctx, fl,
                                   B.upsample2x(sp_slice(skf, c, Bc), fup, masks[j]));
@@ -780,7 +983,7 @@ bool motion_dec::build(backend_t &be, bool with_taps, std::string &err) {
 
                 ggml_tensor *gx = ggml_add(ctx, ggml_tanh(ctx, flch(fl, 0)), xs_x[j]);
                 ggml_tensor *gy = ggml_add(ctx, ggml_tanh(ctx, flch(fl, 1)), xs_y[j]);
-                ggml_tensor *m = ggml_sigmoid(ctx, flch(fl, 2));  // [r,r,Bc]
+                m = ggml_sigmoid(ctx, flch(fl, 2));  // [r,r,Bc]
                 ggml_tensor *m_row = ggml_reshape_3d(ctx, m, 1, N, Bc);
                 ggml_tensor *sampled = B.grid_sample_cl(feats[j], gx, gy, r);  // [C,N,Bc]
                 ggml_tensor *warp_cl = ggml_mul(ctx, sampled, m_row);
@@ -804,6 +1007,7 @@ bool motion_dec::build(backend_t &be, bool with_taps, std::string &err) {
             x = std::move(xn);
             sk = std::move(skn);
             skf = std::move(sfn);
+            if (spatial) x_is_sp = true;
         }
 
         // one output per final chunk: frames [i*bc, (i+1)*bc)
