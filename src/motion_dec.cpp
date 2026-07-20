@@ -994,17 +994,25 @@ bool motion_dec::build(backend_t &be, bool with_taps, std::string &err) {
                     ggml_tensor *gx = ggml_add(ctx, ggml_tanh(ctx, flch(fl, 0)), xs_x[j]);
                     ggml_tensor *gy = ggml_add(ctx, ggml_tanh(ctx, flch(fl, 1)), xs_y[j]);
                     m = ggml_sigmoid(ctx, flch(fl, 2));  // [r,r,1]
-                    ggml_tensor *m4 = ggml_reshape_4d(ctx, m, r, r, 1, 1);
-                    // note: the layout-direct gather (grid_sample_sp) loses
-                    // feat-read coalescing and measures slower than
-                    // gather-CL + transpose; keep the CL form
-                    ggml_tensor *sampled_sp = B.cl_to_sp(
-                        B.grid_sample_cl(feats[j], gx, gy, r), r, r);  // [r,r,C,1]
-                    ggml_tensor *warp = ggml_mul(ctx, sampled_sp, m4);
-                    ggml_tensor *one_m = ggml_reshape_4d(
-                        ctx, ggml_scale_bias(ctx, m, -1.0f, 1.0f), r, r, 1, 1);
-                    ggml_tensor *trunk =
-                        ggml_add(ctx, warp, ggml_mul(ctx, out, one_m));
+                    // gather in CL layout (coalesced feat reads), then fused
+                    // transpose-with-mask ops for warp and trunk
+                    ggml_tensor *sampled = ggml_reshape_2d(
+                        ctx, B.grid_sample_cl(feats[j], gx, gy, r), ST_OC[j], N);
+                    ggml_tensor *warp, *trunk;
+                    if (B.fused) {
+                        warp = ggml_reshape_4d(ctx, ggml_clsp_mul(ctx, sampled, m),
+                                               r, r, ST_OC[j], 1);
+                        trunk = ggml_reshape_4d(ctx, ggml_clsp_lerp(ctx, sampled, m, out),
+                                                r, r, ST_OC[j], 1);
+                    } else {
+                        ggml_tensor *m4 = ggml_reshape_4d(ctx, m, r, r, 1, 1);
+                        ggml_tensor *sampled_sp =
+                            B.cl_to_sp(ggml_reshape_3d(ctx, sampled, ST_OC[j], N, 1), r, r);
+                        warp = ggml_mul(ctx, sampled_sp, m4);
+                        ggml_tensor *one_m = ggml_reshape_4d(
+                            ctx, ggml_scale_bias(ctx, m, -1.0f, 1.0f), r, r, 1, 1);
+                        trunk = ggml_add(ctx, warp, ggml_mul(ctx, out, one_m));
+                    }
                     xn.t.push_back(trunk);
 
                     // ToRGB: 1x1 EqualConv2d direct
