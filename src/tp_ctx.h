@@ -43,7 +43,10 @@ bool sample_chunk_ex(tp_ctx *c, const chunk_io &io, tap_writer *wr,
                      const std::string &chunk_prefix, tap_writer *fmt_wr,
                      int fmt_tap_step, const std::string &fmt_tap_prefix,
                      std::string &err);
+// frames_dst: optional contiguous [n_frames][3*512*512] destination written
+// directly by the batched decoder (skips the per-frame callback copy)
 int generate_impl(tp_ctx *c, const float *image, const float *audio, int64_t n_samples,
-                  int emotion, const float *noise, uint64_t seed, tp_frame_cb cb, void *ud);
+                  int emotion, const float *noise, uint64_t seed, tp_frame_cb cb, void *ud,
+                  float *frames_dst = nullptr);
 
 }  // namespace tp

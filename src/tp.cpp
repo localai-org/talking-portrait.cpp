@@ -67,21 +67,12 @@ int64_t tp_n_frames(int64_t n_samples) {
 
 int64_t tp_n_chunks(int64_t n_frames) { return (n_frames + 49) / 50; }
 
-struct frames_sink {
-    float *out;
-};
-static int frames_cb(int64_t idx, const float *chw, void *ud) {
-    frames_sink *s = (frames_sink *) ud;
-    memcpy(s->out + (size_t) idx * 3 * 512 * 512, chw, (size_t) 3 * 512 * 512 * 4);
-    return 0;
-}
-
 int tp_generate(tp_ctx *c, const float *image, const float *audio, int64_t n_samples,
                 int emotion, const float *noise, uint64_t seed, float *out_frames) {
     if (!c || !image || !audio || !out_frames) return -1;
-    frames_sink s{out_frames};
+    // batched decode writes frames directly into out_frames (no per-frame copy)
     return tp::generate_impl(c, image, audio, n_samples, emotion, noise, seed,
-                             frames_cb, &s);
+                             nullptr, nullptr, out_frames);
 }
 
 int tp_generate_cb(tp_ctx *c, const float *image, const float *audio, int64_t n_samples,

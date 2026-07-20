@@ -8,8 +8,8 @@ peak VRAM <= 2946 MB) inside a 6-hour budget.
 
 | metric | baseline | final | target | fraction |
 |---|---|---|---|---|
-| pipeline 10 s RTF | 6.57 | 10.43-10.47 | 16.47 | 63.6% |
-| decoder fps | 192.1 | 354 (2.82 ms, batch 8) | 513.3 | 69.0% |
+| pipeline 10 s RTF | 6.57 | 10.76-10.85 | 16.47 | 65.9% |
+| decoder fps | 192.1 | 355 (2.81 ms, batch 8) | 513.3 | 69.3% |
 | peak VRAM | 2572 MB | 2690-2710 MB | <= 2946 | OK |
 
 (final numbers = three consecutive passing full `gate-r2` runs at stop;
@@ -65,7 +65,13 @@ green at every step.)
    mdec 3.78 -> 3.11 -> 2.97 -> 2.86 ms across these, each step verified
    bit-consistent (PSNR ~68 dB vs the pre-change frames, i.e. fp16 noise).
 
-4. **Small wins**: flat-batch GEMMs when the A-matrix is shared (batched
+4. **Direct frame write-out**: the batched decoder now writes full batches
+   straight into the caller's frame buffer (`tp_generate` no longer bounces
+   every frame through a per-frame callback memcpy; the padded tail batch
+   still uses a bounce buffer). ~750 MB of host memcpy per 10 s clip gone:
+   RTF 10.46 -> 10.83.
+
+5. **Small wins**: flat-batch GEMMs when the A-matrix is shared (batched
    broadcast mul_mat re-reads A per batch element on Vulkan; folding the
    batch into N streams it once — conv1's n=16 GEMM went 312 -> ~40 us);
    graph-size scaling with batch; per-stage batch-cap/spatial-start tuning
@@ -98,9 +104,9 @@ green at every step.)
   kernels, like inductor does) would absorb. Vulkan CONV_2D only accepts
   f32 activations, so f16 activation storage — the other half of the
   compiled reference's advantage — is blocked without backend surgery.
-- Non-decoder time is ~250 ms per 10 s clip (ODE 5x21 ms, menc 18, audio
-  12, frame readback/copies ~100). The wav2vec conv stem (2x slower than
-  CUDA) and overlap of decode with frame readback are the next levers.
+- Non-decoder time is ~220 ms per 10 s clip (ODE 5x21 ms, menc 18, audio
+  12, GPU->host frame readback ~60). The wav2vec conv stem (2x slower than
+  CUDA) and overlapping decode with the readback are the next levers.
 - The batched exact graph idea (batching the conservative graph for
   parity-dump throughput) was out of scope; parity taps stay batch-1.
 

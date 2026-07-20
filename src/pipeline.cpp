@@ -99,7 +99,8 @@ bool sample_chunk(tp_ctx *c, const chunk_io &io, tap_sink &tap, int fmt_tap_step
 // ---------------- end-to-end ----------------
 
 int generate_impl(tp_ctx *c, const float *image, const float *audio, int64_t n_samples,
-                  int emotion, const float *noise, uint64_t seed, tp_frame_cb cb, void *ud) {
+                  int emotion, const float *noise, uint64_t seed, tp_frame_cb cb, void *ud,
+                  float *frames_dst) {
     std::string &err = c->err;
     const int64_t n_frames = tp_n_frames(n_samples);
     const int64_t n_chunks = tp_n_chunks(n_frames);
@@ -166,11 +167,17 @@ int generate_impl(tp_ctx *c, const float *image, const float *audio, int64_t n_s
             for (int i = 0; i < 512; i++)
                 st[(size_t) i] = m.appearance[(size_t) i] + r_d[(size_t) t * D + i];
         }
-        if (!c->mdec.decode_batch(c->be, styles.data(), frames.data(), err)) return -1;
+        // full batches can land straight in the caller's frame buffer (the
+        // padded tail batch goes through the bounce buffer)
+        const int64_t nb = std::min<int64_t>(BQ, n_frames - t0);
+        float *dst = (frames_dst && nb == BQ) ? frames_dst + (size_t) t0 * fsz
+                                              : frames.data();
+        if (!c->mdec.decode_batch(c->be, styles.data(), dst, err)) return -1;
+        if (frames_dst && nb < BQ)
+            memcpy(frames_dst + (size_t) t0 * fsz, dst, (size_t) nb * fsz * 4);
         if (cb) {
-            const int64_t nb = std::min<int64_t>(BQ, n_frames - t0);
             for (int64_t b = 0; b < nb; b++) {
-                const int rc = cb(t0 + b, frames.data() + (size_t) b * fsz, ud);
+                const int rc = cb(t0 + b, dst + (size_t) b * fsz, ud);
                 if (rc) return (int) n_frames;
             }
         }
