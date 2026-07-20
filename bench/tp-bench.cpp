@@ -129,22 +129,25 @@ int main(int argc, char **argv) {
         }
     }
 
-    // mdec per frame
+    // mdec per frame (batched: mdec.batch frames per dispatch)
     if (want("mdec")) {
         if (!c->mdec.built || c->mdec.taps_in_graph) c->mdec.build(c->be, false, c->err);
         c->mdec.set_feats(m, c->err);
-        std::vector<float> style(512), img((size_t) 3 * 512 * 512);
-        for (int i = 0; i < 512; i++) style[(size_t) i] = m.appearance[(size_t) i];
-        c->mdec.decode(c->be, style.data(), img.data(), no_tap, c->err);  // warmup x2
-        c->mdec.decode(c->be, style.data(), img.data(), no_tap, c->err);
+        const int BQ = c->mdec.batch;
+        std::vector<float> style((size_t) BQ * 512), img((size_t) BQ * 3 * 512 * 512);
+        for (int b = 0; b < BQ; b++)
+            for (int i = 0; i < 512; i++)
+                style[(size_t) b * 512 + i] = m.appearance[(size_t) i];
+        c->mdec.decode_batch(c->be, style.data(), img.data(), c->err);  // warmup x2
+        c->mdec.decode_batch(c->be, style.data(), img.data(), c->err);
         double t0 = now_ms();
         const int it = iters * 5;
         for (int i = 0; i < it; i++)
-            c->mdec.decode(c->be, style.data(), img.data(), no_tap, c->err);
-        double ms = (now_ms() - t0) / it;
+            c->mdec.decode_batch(c->be, style.data(), img.data(), c->err);
+        double ms = (now_ms() - t0) / (it * BQ);
         snprintf(buf, sizeof buf, "%.2f ms", ms);
         char rate[64];
-        snprintf(rate, sizeof rate, "%.1f fps", 1000.0 / ms);
+        snprintf(rate, sizeof rate, "%.1f fps (batch %d)", 1000.0 / ms, BQ);
         rows.push_back({"mdec (per frame)", buf, rate});
     }
 

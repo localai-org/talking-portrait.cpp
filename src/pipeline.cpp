@@ -2,6 +2,7 @@
 #include "tp.h"
 #include "tp_ctx.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <random>
@@ -153,14 +154,25 @@ int generate_impl(tp_ctx *c, const float *image, const float *audio, int64_t n_s
     }
     if (!c->mdec.set_feats(m, err)) return -1;
 
-    std::vector<float> style(512), frame((size_t) 3 * 512 * 512);
-    for (int64_t t = 0; t < n_frames; t++) {
-        for (int i = 0; i < 512; i++)
-            style[(size_t) i] = m.appearance[(size_t) i] + r_d[(size_t) t * D + i];
-        if (!c->mdec.decode(c->be, style.data(), frame.data(), no_tap, err)) return -1;
+    // batched decode: BQ frames per graph dispatch (last batch padded by
+    // repeating the final frame's style; pad frames are discarded)
+    const int BQ = c->mdec.batch;
+    const size_t fsz = (size_t) 3 * 512 * 512;
+    std::vector<float> styles((size_t) BQ * 512), frames((size_t) BQ * fsz);
+    for (int64_t t0 = 0; t0 < n_frames; t0 += BQ) {
+        for (int64_t b = 0; b < BQ; b++) {
+            const int64_t t = std::min(t0 + b, n_frames - 1);
+            float *st = styles.data() + (size_t) b * 512;
+            for (int i = 0; i < 512; i++)
+                st[(size_t) i] = m.appearance[(size_t) i] + r_d[(size_t) t * D + i];
+        }
+        if (!c->mdec.decode_batch(c->be, styles.data(), frames.data(), err)) return -1;
         if (cb) {
-            const int rc = cb(t, frame.data(), ud);
-            if (rc) break;
+            const int64_t nb = std::min<int64_t>(BQ, n_frames - t0);
+            for (int64_t b = 0; b < nb; b++) {
+                const int rc = cb(t0 + b, frames.data() + (size_t) b * fsz, ud);
+                if (rc) return (int) n_frames;
+            }
         }
     }
     return (int) n_frames;

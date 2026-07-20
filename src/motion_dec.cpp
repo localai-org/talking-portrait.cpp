@@ -193,19 +193,24 @@ bool motion_dec::prepare(backend_t &be, std::string &err) {
     return true;
 }
 
-// per-frame graph build ------------------------------------------------
+// graph build ----------------------------------------------------------
+//
+// The fast (generation) graph is batched: BATCH frames per dispatch, all
+// tensors carry the batch as their outermost dim (CL data [C, N, Bc]).
+// Per-stage batch caps chunk the batch inside the graph to bound peak
+// im2col memory at the big maps; chunk lists + views avoid any concat.
 
 struct mdec_build {
     plan_t &p;
     ggml_context *ctx;
     weights_t *w;
     std::map<std::string, ggml_tensor *> &derived;
-    ggml_tensor *latent = nullptr;  // [512,1]
-    ggml_tensor *one = nullptr;     // [1,1] const 1.0
+    ggml_tensor *latent = nullptr;  // [512, B]
+    ggml_tensor *one = nullptr;     // [1, B] const 1.0
     std::string err;
 
-    // Dataflow is CHANNEL-LAST ([C, N] GEMM outputs); spatial [W,H,C] is
-    // materialized only where im2col / FIR / taps need it.
+    // Dataflow is CHANNEL-LAST ([C, N, Bc] GEMM outputs); spatial
+    // [W,H,C,Bc] is materialized only where im2col / FIR / taps need it.
 
     ggml_tensor *need(const std::string &n) {
         ggml_tensor *t = w->get(n);
@@ -220,48 +225,47 @@ struct mdec_build {
         }
         return it->second;
     }
+    // batch slice [*, Bc] of a full-batch [*, B] per-frame vector
+    ggml_tensor *bstyle(ggml_tensor *t, int64_t c, int64_t Bc) {
+        if (t->ne[1] == Bc && c == 0) return t;
+        return ggml_view_2d(ctx, t, t->ne[0], Bc, t->nb[1], (size_t) c * Bc * t->nb[1]);
+    }
     ggml_tensor *style_of(const std::string &base) {
         ggml_tensor *mw = need(base + ".modulation.weight");
         ggml_tensor *mb = need(base + ".modulation.bias");
         if (!mw || !mb) return nullptr;
-        return linear(ctx, mw, mb, latent);  // [IC,1]
+        return linear(ctx, mw, mb, latent);  // [IC, B]
     }
-    // demodulation denominator sqrt(S s^2 + eps) [OC,1]; S is pre-halved so
+    // demodulation denominator sqrt(S s^2 + eps) [OC, B]; S is pre-halved so
     // this also folds the FusedLeakyReLU sqrt(2)
     ggml_tensor *demod_den(const std::string &wname, ggml_tensor *style) {
         ggml_tensor *sa = der("saug." + wname);
         if (!sa) return nullptr;
-        ggml_tensor *s2 = ggml_concat(ctx, ggml_sqr(ctx, style), one, 0);  // [IC+1,1]
-        return ggml_sqrt(ctx, ggml_mul_mat(ctx, sa, s2));                  // [OC,1]
+        ggml_tensor *s2 = ggml_concat(ctx, ggml_sqr(ctx, style), one, 0);  // [IC+1,B]
+        return ggml_sqrt(ctx, ggml_mul_mat(ctx, sa, s2));                  // [OC,B]
     }
-    // GEMM A-matrix with optional per-in-channel style and per-out-channel
-    // 1/den folded in (weight-sized passes instead of full-map passes)
+    // GEMM A-matrix (rows kk-fastest) with optional per-in-channel style and
+    // per-out-channel 1/den folded in; per-batch styles yield [KK*IC,OC,Bc]
     ggml_tensor *gemm_weight(ggml_tensor *W4d, ggml_tensor *style, ggml_tensor *den) {
         const int64_t KK = W4d->ne[0] * W4d->ne[1], IC = W4d->ne[2], OC = W4d->ne[3];
         ggml_tensor *A = ggml_reshape_2d(ctx, W4d, KK * IC, OC);
-        if (style || den) {
-            if (A->type != GGML_TYPE_F32) A = ggml_cast(ctx, A, GGML_TYPE_F32);
-            if (style) {
-                ggml_tensor *sty = ggml_repeat_4d(ctx, ggml_reshape_2d(ctx, style, 1, IC),
-                                                  KK, IC, 1, 1);
-                A = ggml_mul(ctx, A, ggml_reshape_2d(ctx, sty, KK * IC, 1));
-            }
-            if (den) A = ggml_div(ctx, A, ggml_reshape_2d(ctx, den, 1, OC));
-            if (W4d->type != GGML_TYPE_F32) A = ggml_cast(ctx, A, W4d->type);
+        if (!style && !den) return A;
+        const int64_t Bc = style ? style->ne[1] : den->ne[1];
+        const ggml_type t0 = A->type;
+        ggml_tensor *Af = t0 == GGML_TYPE_F32 ? A : ggml_cast(ctx, A, GGML_TYPE_F32);
+        if (Bc > 1) Af = ggml_repeat_4d(ctx, Af, KK * IC, OC, Bc, 1);
+        if (style) {
+            ggml_tensor *sty = ggml_repeat_4d(ctx, ggml_reshape_3d(ctx, style, 1, IC, Bc),
+                                              KK, IC, Bc, 1);
+            Af = ggml_mul(ctx, Af, ggml_reshape_3d(ctx, sty, KK * IC, 1, Bc));
         }
-        return A;
+        if (den) Af = ggml_div(ctx, Af, ggml_reshape_3d(ctx, den, 1, OC, Bc));
+        return t0 == GGML_TYPE_F32 ? Af : ggml_cast(ctx, Af, t0);
     }
-    // conv (stride 1) producing channel-last [OC, N]
-    ggml_tensor *conv_cl(ggml_tensor *W4d, ggml_tensor *style, ggml_tensor *den,
-                         ggml_tensor *x_sp, int pad) {
-        ggml_tensor *A = gemm_weight(W4d, style, den);
-        ggml_tensor *im = ggml_im2col(ctx, W4d, x_sp, 1, 1, pad, pad, 1, 1, true, W4d->type);
-        return ggml_mul_mat(
-            ctx, A, ggml_reshape_2d(ctx, im, im->ne[0], im->ne[1] * im->ne[2] * im->ne[3]));
-    }
-    // channel-last [C, N] -> spatial [W, H, C]
+    // channel-last [C, N, Bc] -> spatial [W, H, C, Bc]
     ggml_tensor *cl_to_sp(ggml_tensor *t_cl, int64_t Wd, int64_t Hd) {
-        ggml_tensor *t = ggml_reshape_3d(ctx, t_cl, t_cl->ne[0], Wd, Hd);
+        ggml_tensor *t = ggml_reshape_4d(ctx, t_cl, t_cl->ne[0], Wd, Hd,
+                                         t_cl->ne[1] * t_cl->ne[2] / (Wd * Hd));
         return ggml_cont(ctx, ggml_permute(ctx, t, 2, 0, 1, 3));
     }
     // FusedLeakyReLU on channel-last (sqrt2 folded upstream); ab [1,1,C,1]
@@ -275,95 +279,107 @@ struct mdec_build {
         return 4 * wsz < 2 * N * (ic + oc);
     }
     // fold style (per-in-channel, cf tiling) and 1/den (per-out-channel)
-    // into a cf-ordered GEMM matrix A [R, OC']
-    ggml_tensor *fold_A(ggml_tensor *A, ggml_tensor *style, ggml_tensor *den, int64_t IC) {
+    // into a cf-ordered GEMM matrix A [R, OC'] -> [R, OC', Bc]
+    ggml_tensor *fold_A(ggml_tensor *A, ggml_tensor *style, ggml_tensor *den) {
         if (!style && !den) return A;
+        const int64_t R = A->ne[0], OCp = A->ne[1];
+        const int64_t Bc = style ? style->ne[1] : den->ne[1];
         const ggml_type t0 = A->type;
         ggml_tensor *Af = t0 == GGML_TYPE_F32 ? A : ggml_cast(ctx, A, GGML_TYPE_F32);
+        if (Bc > 1) Af = ggml_repeat_4d(ctx, Af, R, OCp, Bc, 1);
         if (style) {
-            const int64_t KK = A->ne[0] / IC;
-            ggml_tensor *sty = ggml_repeat_4d(ctx, style, IC * KK, 1, 1, 1);  // tile
-            Af = ggml_mul(ctx, Af, sty);
+            // cf rows are ic-fastest (r % IC = ic): plain tile along dim0
+            ggml_tensor *sty = ggml_repeat_4d(ctx, style, R, Bc, 1, 1);
+            Af = ggml_mul(ctx, Af, ggml_reshape_3d(ctx, sty, R, 1, Bc));
         }
-        if (den) Af = ggml_div(ctx, Af, ggml_reshape_2d(ctx, den, 1, den->ne[0]));
+        if (den) Af = ggml_div(ctx, Af, ggml_reshape_3d(ctx, den, 1, den->ne[0], Bc));
         return t0 == GGML_TYPE_F32 ? Af : ggml_cast(ctx, Af, t0);
     }
-    // channels-first conv: x_cl [IC, N] over a WxH map, A [IC*9, OC'] -> [OC', N]
-    ggml_tensor *conv_cf(ggml_tensor *A, ggml_tensor *x_cl, int64_t W, int64_t H, int pad) {
-        const int64_t IC = x_cl->ne[0];
-        ggml_tensor *x3 = ggml_reshape_3d(ctx, x_cl, IC, W, H);
-        ggml_tensor *shape4 = ggml_reshape_4d(ctx, A, 3, 3, IC, A->ne[1]);  // dims only
-        ggml_tensor *im = ggml_im2col_cf(ctx, shape4, x3, 1, 1, pad, pad, 1, 1, A->type);
-        return ggml_mul_mat(ctx, A,
-                            ggml_reshape_2d(ctx, im, im->ne[0], im->ne[1] * im->ne[2]));
+    // channels-first conv: x_cl [IC, N, Bc] over a WxH map. A2 [IC*9, OC']
+    // carries the kernel dims; Af is A2 itself or a folded [IC*9, OC', Bc]
+    ggml_tensor *conv_cf(ggml_tensor *A2, ggml_tensor *Af, ggml_tensor *x_cl,
+                         int64_t W, int64_t H, int pad) {
+        const int64_t IC = x_cl->ne[0], Bc = x_cl->ne[2];
+        ggml_tensor *x4 = ggml_reshape_4d(ctx, x_cl, IC, W, H, Bc);
+        ggml_tensor *shape4 = ggml_reshape_4d(ctx, A2, 3, 3, IC, A2->ne[1]);  // dims only
+        ggml_tensor *im = ggml_im2col_cf(ctx, shape4, x4, 1, 1, pad, pad, 1, 1, A2->type);
+        return ggml_mul_mat(
+            ctx, Af, ggml_reshape_3d(ctx, im, im->ne[0], im->ne[1] * im->ne[2], Bc));
     }
-    // normal modulated conv 3x3 (demodulate) + FLReLU: CL in, CL out
-    ggml_tensor *styled_conv(ggml_tensor *x_cl, int64_t W, int64_t H, const std::string &base) {
-        ggml_tensor *style = style_of(base + ".conv");
+    // normal modulated conv 3x3 (demodulate) + FLReLU: CL in, CL out.
+    // style/den are full-batch [., B]; c/Bc select the chunk.
+    ggml_tensor *styled_conv(ggml_tensor *x_cl, int64_t W, int64_t H, const std::string &base,
+                             ggml_tensor *style, ggml_tensor *den, int64_t c, int64_t Bc) {
         ggml_tensor *A = der("acf." + base + ".conv.weight");
         ggml_tensor *ab = need(base + ".activate.bias");
-        if (!style || !A || !ab) return nullptr;
-        ggml_tensor *den = demod_den(base + ".conv.weight", style);
-        if (!den) return nullptr;
+        if (!style || !den || !A || !ab) return nullptr;
+        ggml_tensor *sty = bstyle(style, c, Bc), *dn = bstyle(den, c, Bc);
         const int64_t N = W * H, IC = x_cl->ne[0];
         ggml_tensor *y;
         if (fold_into_weights(A->ne[0] * A->ne[1], N, IC, A->ne[1])) {
-            y = conv_cf(fold_A(A, style, den, IC), x_cl, W, H, 1);
+            y = conv_cf(A, fold_A(A, sty, dn), x_cl, W, H, 1);
         } else {
-            y = conv_cf(A, ggml_mul(ctx, x_cl, style), W, H, 1);
-            y = ggml_div(ctx, y, den);
+            y = conv_cf(A, A,
+                        ggml_mul(ctx, x_cl, ggml_reshape_3d(ctx, sty, IC, 1, Bc)), W, H, 1);
+            y = ggml_div(ctx, y, ggml_reshape_3d(ctx, dn, dn->ne[0], 1, Bc));
         }
         return bias_lrelu_cl(y, ab);
     }
-    // first 4x4 styled conv (spatial const input, tiny)
-    ggml_tensor *styled_conv_input(ggml_tensor *x_sp, const std::string &base) {
-        ggml_tensor *style = style_of(base + ".conv");
+    // first 4x4 styled conv (spatial const input, tiny; full batch)
+    ggml_tensor *styled_conv_input(ggml_tensor *x_sp, const std::string &base,
+                                   ggml_tensor *style, ggml_tensor *den) {
         ggml_tensor *W = need(base + ".conv.weight");
         ggml_tensor *ab = need(base + ".activate.bias");
-        if (!style || !W || !ab) return nullptr;
-        ggml_tensor *den = demod_den(base + ".conv.weight", style);
-        if (!den) return nullptr;
-        ggml_tensor *xs = ggml_mul(ctx, x_sp, ggml_reshape_4d(ctx, style, 1, 1, style->ne[0], 1));
-        ggml_tensor *y = conv_cl(W, nullptr, nullptr, xs, 1);  // [OC, N]
-        y = ggml_div(ctx, y, den);
-        return bias_lrelu_cl(y, ab);
+        if (!W || !ab || !style || !den) return nullptr;
+        const int64_t C = style->ne[0], Bb = style->ne[1];
+        ggml_tensor *x = x_sp;
+        if (Bb > 1)
+            x = ggml_repeat_4d(ctx, x_sp, x_sp->ne[0], x_sp->ne[1], x_sp->ne[2], Bb);
+        ggml_tensor *xs = ggml_mul(ctx, x, ggml_reshape_4d(ctx, style, 1, 1, C, Bb));
+        ggml_tensor *im = ggml_im2col(ctx, W, xs, 1, 1, 1, 1, 1, 1, true, W->type);
+        ggml_tensor *Am = ggml_reshape_2d(ctx, W, W->ne[0] * W->ne[1] * W->ne[2], W->ne[3]);
+        ggml_tensor *y = ggml_mul_mat(
+            ctx, Am, ggml_reshape_3d(ctx, im, im->ne[0], im->ne[1] * im->ne[2], Bb));
+        y = ggml_div(ctx, y, ggml_reshape_3d(ctx, den, den->ne[0], 1, Bb));
+        return bias_lrelu_cl(y, ab);  // [OC, 16, B]
     }
     // upsampling modulated conv: sub-pixel form of conv_transpose(s2)+Blur —
     // one 3x3 pad-1 conv, 4 parity classes stacked on OC, interleaved in
-    // channel-last (ne3 kept 1: CUDA concat launches per ne3 slice)
-    ggml_tensor *styled_conv_up(ggml_tensor *x_cl, int64_t W, int64_t H, const std::string &base) {
-        ggml_tensor *style = style_of(base + ".conv");
+    // channel-last; batch rides on ne3 through the interleave
+    ggml_tensor *styled_conv_up(ggml_tensor *x_cl, int64_t W, int64_t H, const std::string &base,
+                                ggml_tensor *style, ggml_tensor *den, int64_t c, int64_t Bc) {
         ggml_tensor *Ts = der("tsubcf." + base + ".conv.weight");
         ggml_tensor *ab = need(base + ".activate.bias");
-        if (!style || !Ts || !ab) return nullptr;
-        ggml_tensor *den = demod_den(base + ".conv.weight", style);
-        if (!den) return nullptr;
+        if (!style || !den || !Ts || !ab) return nullptr;
         const int64_t OC = Ts->ne[1] / 4, IC = x_cl->ne[0];
         const int64_t N = W * H;
+        ggml_tensor *sty = bstyle(style, c, Bc), *dn = bstyle(den, c, Bc);
+        // per-parity denominator: column q = k*OC + o, q % OC = o -> tile
+        ggml_tensor *den4 = ggml_repeat_4d(ctx, dn, 4 * OC, Bc, 1, 1);
         ggml_tensor *y4;
         if (fold_into_weights(Ts->ne[0] * Ts->ne[1], N, IC, Ts->ne[1])) {
-            ggml_tensor *den4 = ggml_repeat_4d(ctx, den, 4 * OC, 1, 1, 1);
-            y4 = conv_cf(fold_A(Ts, style, den4, IC), x_cl, W, H, 1);
+            y4 = conv_cf(Ts, fold_A(Ts, sty, den4), x_cl, W, H, 1);
         } else {
-            y4 = conv_cf(Ts, ggml_mul(ctx, x_cl, style), W, H, 1);
-            y4 = ggml_div(ctx, y4, ggml_repeat_4d(ctx, den, 4 * OC, 1, 1, 1));
+            y4 = conv_cf(Ts, Ts,
+                         ggml_mul(ctx, x_cl, ggml_reshape_3d(ctx, sty, IC, 1, Bc)), W, H, 1);
+            y4 = ggml_div(ctx, y4, ggml_reshape_3d(ctx, den4, 4 * OC, 1, Bc));
         }
         ggml_tensor *cls[4];
         for (int k = 0; k < 4; k++)
-            cls[k] = ggml_cont(ctx, ggml_view_2d(ctx, y4, OC, N, y4->nb[1],
-                                                 (size_t) k * OC * 4));
+            cls[k] = ggml_cont(ctx, ggml_view_3d(ctx, y4, OC, N, Bc, y4->nb[1], y4->nb[2],
+                                                 (size_t) k * OC * y4->nb[0]));
         // u-interleave: (o, bx, m) -> flat o + OC*bx + 2OC*m
         ggml_tensor *E[2];
         for (int by = 0; by < 2; by++) {
-            ggml_tensor *a = ggml_reshape_3d(ctx, cls[by * 2 + 0], OC, 1, N);
-            ggml_tensor *b = ggml_reshape_3d(ctx, cls[by * 2 + 1], OC, 1, N);
-            // [OC,2,N] == flat o + OC*bx + 2OC*(x + W*y) -> [(o,u), y]
-            E[by] = ggml_reshape_2d(ctx, ggml_concat(ctx, a, b, 1), OC * 2 * W, H);
+            ggml_tensor *a = ggml_reshape_4d(ctx, cls[by * 2 + 0], OC, 1, N, Bc);
+            ggml_tensor *b = ggml_reshape_4d(ctx, cls[by * 2 + 1], OC, 1, N, Bc);
+            // [OC,2,N,Bc] == flat o + OC*bx + 2OC*(x + W*y) -> [(o,u), y, b]
+            E[by] = ggml_reshape_3d(ctx, ggml_concat(ctx, a, b, 1), OC * 2 * W, H, Bc);
         }
         // v-interleave: (q, by, y) -> flat q + 2OCW*by + 4OCW*y
-        ggml_tensor *F = ggml_concat(ctx, ggml_reshape_3d(ctx, E[0], OC * 2 * W, 1, H),
-                                     ggml_reshape_3d(ctx, E[1], OC * 2 * W, 1, H), 1);
-        F = ggml_reshape_2d(ctx, F, OC, 4 * N);  // CL over the 2W x 2H map
+        ggml_tensor *F = ggml_concat(ctx, ggml_reshape_4d(ctx, E[0], OC * 2 * W, 1, H, Bc),
+                                     ggml_reshape_4d(ctx, E[1], OC * 2 * W, 1, H, Bc), 1);
+        F = ggml_reshape_3d(ctx, F, OC, 4 * N, Bc);  // CL over the 2W x 2H map
         return bias_lrelu_cl(F, ab);
     }
     // upfirdn2d up=2 pad(2,1) with a x4 kernel (Upsample module, 3-channel)
@@ -418,12 +434,15 @@ struct mdec_build {
         return ggml_reshape_2d(ctx, t, t->ne[0], t->ne[1] * t->ne[2]);
     }
 
-    // bilinear zeros-padding grid_sample of feat_t [C, r*r]: returns CL [C, r*r]
+    // bilinear zeros-padding grid_sample of feat_t [C, r*r] at grid points
+    // gx/gy [r, r, Bc] (feat shared across the batch): returns CL [C, r*r, Bc]
     ggml_tensor *grid_sample_cl(ggml_tensor *feat_t, ggml_tensor *gx, ggml_tensor *gy, int r) {
-        const int64_t NN = (int64_t) r * r;
+        const int64_t Bc = gx->ne[2];
+        const int64_t NN = (int64_t) r * r * Bc;
         ggml_tensor *grid = ggml_concat(ctx, ggml_reshape_2d(ctx, gx, 1, NN),
-                                        ggml_reshape_2d(ctx, gy, 1, NN), 0);  // [2, N]
-        return ggml_bilinear_gather(ctx, feat_t, grid, r, r);
+                                        ggml_reshape_2d(ctx, gy, 1, NN), 0);  // [2, N*Bc]
+        ggml_tensor *s = ggml_bilinear_gather(ctx, feat_t, grid, r, r);
+        return ggml_reshape_3d(ctx, s, s->ne[0], (int64_t) r * r, Bc);
     }
 };
 
@@ -456,16 +475,18 @@ bool motion_dec::build(backend_t &be, bool with_taps, std::string &err) {
             // channels of feat j == ST_OC[j] (conv{6-j} channels match stage OC)
             mk(nm, ST_OC[j], (int64_t) r * r, w->keep_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32);
         }
-        mk("one", 1, 1);
+        mk("ones", 1, MAX_BATCH);
         cbuf = ggml_backend_alloc_ctx_tensors(cctx, be.be);
         if (!cbuf) {
             err = "failed to allocate mdec const buffer";
             return false;
         }
-        // fill masks / identity grids / one
+        // fill masks / identity grids / ones
         std::vector<float> buf;
-        const float one = 1.0f;
-        ggml_backend_tensor_set(consts["one"], &one, 0, 4);
+        {
+            const std::vector<float> ones((size_t) MAX_BATCH, 1.0f);
+            ggml_backend_tensor_set(consts["ones"], ones.data(), 0, MAX_BATCH * 4);
+        }
         for (int j = 0; j < 7; j++) {
             const int r = 8 << j;
             char nm[24];
@@ -497,15 +518,32 @@ bool motion_dec::build(backend_t &be, bool with_taps, std::string &err) {
         snprintf(nm, sizeof nm, "feat%d", j);
         feats[j] = consts[nm];
     }
-    onec = consts["one"];
+    onec = consts["ones"];
+
+    // TP_MDEC_EXACT=1 forces the conservative graph for generation too:
+    // measurement knob for backends where the fast graph's custom ops fall
+    // back to the CPU (e.g. Vulkan). Taps stay tied to with_taps.
+    const bool exact_graph = with_taps || getenv("TP_MDEC_EXACT") != nullptr;
+
+    // fast-graph batch: frames per graph dispatch (ship default 8)
+    int bsz = 1;
+    if (!exact_graph) {
+        bsz = 8;
+        if (const char *e = getenv("TP_MDEC_BATCH")) bsz = atoi(e);
+        if (bsz < 1) bsz = 1;
+        if (bsz > MAX_BATCH) bsz = MAX_BATCH;
+        // chunk caps require power-of-two divisibility
+        while (bsz & (bsz - 1)) bsz--;
+    }
+    batch = bsz;
 
     plan_t &p = frame;
     p.begin(4096);
     ggml_context *ctx = p.ctx;
     mdec_build B{p, ctx, w, derived};
 
-    B.latent = p.input("style", ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 512, 1));
-    B.one = onec;
+    B.latent = p.input("style", ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 512, bsz));
+    B.one = ggml_view_2d(ctx, onec, 1, bsz, onec->nb[1], 0);
 
     std::vector<tap_entry> taps;
     auto reg = [&](const std::string &name, ggml_tensor *t, std::vector<int64_t> sh) {
@@ -525,11 +563,6 @@ bool motion_dec::build(backend_t &be, bool with_taps, std::string &err) {
         max_stage = atoi(e);
         if (max_stage < 1 || max_stage > 7) max_stage = 7;
     }
-
-    // TP_MDEC_EXACT=1 forces the conservative graph for generation too:
-    // measurement knob for backends where the fast graph's custom ops fall
-    // back to the CPU (e.g. Vulkan). Taps stay tied to with_taps.
-    const bool exact_graph = with_taps || getenv("TP_MDEC_EXACT") != nullptr;
 
     if (exact_graph) {
         // ---- numerically-conservative parity graph (spatial, direct convs,
@@ -624,120 +657,164 @@ bool motion_dec::build(backend_t &be, bool with_taps, std::string &err) {
 
             out = trunk;
         }
+        p.output("img", skip);  // [512,512,3] (truncated when TP_MDEC_STAGES<7)
+        img_chunks = 0;
     } else {
+        // ---- batched fast graph: bsz frames per dispatch. Per-stage batch
+        // caps chunk the batch inside the graph so peak im2col memory at the
+        // big maps stays at the per-frame level; chunk lists sliced by views
+        // keep the whole thing concat-free. ----
+        struct bchunks {
+            std::vector<ggml_tensor *> t;  // equal batch-size chunks
+            int64_t bc = 0;                // frames per chunk
+        };
+        // slice Bc frames starting at c*Bc out of a CL [C, N, bc] chunk list
+        auto cl_slice = [&](bchunks &l, int64_t c, int64_t Bc) -> ggml_tensor * {
+            ggml_tensor *src = l.t[(size_t) (c * Bc / l.bc)];
+            if (Bc == l.bc) return src;
+            const int64_t off = (c * Bc) % l.bc;
+            return ggml_view_3d(ctx, src, src->ne[0], src->ne[1], Bc, src->nb[1],
+                                src->nb[2], (size_t) off * src->nb[2]);
+        };
+        // same for spatial [W, H, C, bc] chunk lists
+        auto sp_slice = [&](bchunks &l, int64_t c, int64_t Bc) -> ggml_tensor * {
+            ggml_tensor *src = l.t[(size_t) (c * Bc / l.bc)];
+            if (Bc == l.bc) return src;
+            const int64_t off = (c * Bc) % l.bc;
+            return ggml_view_4d(ctx, src, src->ne[0], src->ne[1], src->ne[2], Bc,
+                                src->nb[1], src->nb[2], src->nb[3],
+                                (size_t) off * src->nb[3]);
+        };
+        // channel plane [r, r, Bc] out of a flowmap [r, r, 3, Bc]
+        auto flch = [&](ggml_tensor *fl, int chn) {
+            return ggml_cont(ctx, ggml_view_3d(ctx, fl, fl->ne[0], fl->ne[1], fl->ne[3],
+                                               fl->nb[1], fl->nb[3],
+                                               (size_t) chn * fl->nb[2]));
+        };
+
+        // per-stage batch caps (peak-VRAM guard); env TP_MDEC_BMAX=csv, 0=full
+        int64_t cap[7] = {bsz, bsz, bsz, bsz, bsz,
+                          std::min<int64_t>(bsz, 2), std::min<int64_t>(bsz, 1)};
+        if (const char *e = getenv("TP_MDEC_BMAX")) {
+            char tmp[128];
+            snprintf(tmp, sizeof tmp, "%s", e);
+            char *save = nullptr;
+            int idx = 0;
+            for (char *tok = strtok_r(tmp, ",", &save); tok && idx < 7;
+                 tok = strtok_r(nullptr, ",", &save), idx++) {
+                const int v = atoi(tok);
+                cap[idx] = v < 1 ? bsz : v;
+            }
+        }
+        for (int j = 0; j < 7; j++) {
+            if (cap[j] > bsz) cap[j] = bsz;
+            while (cap[j] > 1 && bsz % cap[j]) cap[j]--;   // must divide bsz
+            if (j > 0 && cap[j] > cap[j - 1]) cap[j] = cap[j - 1];  // monotone
+        }
+
         // constant input + conv1 + (no to_rgb1 in forward)
         ggml_tensor *cinp = B.need("dec.input.input");  // [4,4,512,1]
-        if (!cinp) {
-            err = B.err;
+        ggml_tensor *s0 = B.style_of("dec.conv1.conv");
+        ggml_tensor *d0 = s0 ? B.demod_den("dec.conv1.conv.weight", s0) : nullptr;
+        ggml_tensor *x0 =
+            (cinp && s0 && d0) ? B.styled_conv_input(cinp, "dec.conv1", s0, d0) : nullptr;
+        if (!x0) {
+            err = B.err.empty() ? "conv1 failed" : B.err;
             return false;
         }
-        ggml_tensor *x_cl = B.styled_conv_input(cinp, "dec.conv1");  // [512, 16]
-        if (!x_cl) {
-            err = B.err;
-            return false;
-        }
-        if (with_taps) reg("conv1_4", B.cl_to_sp(x_cl, 4, 4), {1, 512, 4, 4});
+        bchunks x{{x0}, bsz};    // trunk, CL [C, N, bc]
+        bchunks sk{{}, bsz};     // rgb accumulator, spatial [r, r, 3, bc]
+        bchunks skf{{}, bsz};    // flow accumulator, spatial [r, r, 3, bc]
 
         for (int j = 0; j < max_stage; j++) {
             const int r = 8 << j;
             const int64_t N = (int64_t) r * r;
+            const int64_t Bc = cap[j], nch = bsz / Bc;
             char b1[32], b2[32], bf[32], br[32];
             snprintf(b1, sizeof b1, "dec.convs.%d", 2 * j);
             snprintf(b2, sizeof b2, "dec.convs.%d", 2 * j + 1);
             snprintf(bf, sizeof bf, "dec.to_flows.%d", j);
             snprintf(br, sizeof br, "dec.to_rgbs.%d", j);
-            char tn[32];
+            const std::string fbase = bf, rbase = br;
 
-            ggml_tensor *c1_cl = B.styled_conv_up(x_cl, r / 2, r / 2, b1);  // [OC, N]
-            if (!c1_cl) {
-                err = B.err;
-                return false;
-            }
-            if (with_taps) {
-                snprintf(tn, sizeof tn, "r%d.conv1", r);
-                reg(tn, B.cl_to_sp(c1_cl, r, r), {1, ST_OC[j], r, r});
-            }
-            ggml_tensor *out_cl = B.styled_conv(c1_cl, r, r, b2);  // [OC, N]
-            if (!out_cl) {
-                err = B.err;
-                return false;
-            }
-            if (with_taps) {
-                snprintf(tn, sizeof tn, "r%d.conv2", r);
-                reg(tn, B.cl_to_sp(out_cl, r, r), {1, ST_OC[j], r, r});
-            }
-
-            // ---- ToFlow: 1x1 modulated conv == plain GEMM on the CL tensor ----
-            const std::string fbase = bf;
+            // stage styles: one batched computation, sliced per chunk
+            ggml_tensor *s1 = B.style_of(std::string(b1) + ".conv");
+            ggml_tensor *d1 = s1 ? B.demod_den(std::string(b1) + ".conv.weight", s1) : nullptr;
+            ggml_tensor *s2 = B.style_of(std::string(b2) + ".conv");
+            ggml_tensor *d2 = s2 ? B.demod_den(std::string(b2) + ".conv.weight", s2) : nullptr;
             ggml_tensor *fstyle = B.style_of(fbase + ".conv");
             ggml_tensor *fW = B.need(fbase + ".conv.weight");
             ggml_tensor *fbias = B.need(fbase + ".bias");
             ggml_tensor *fup = B.need(fbase + ".upsample.kernel");
-            if (!fstyle || !fW || !fbias || !fup) {
-                err = B.err;
-                return false;
-            }
-            ggml_tensor *fl_cl = ggml_mul_mat(ctx, B.gemm_weight(fW, fstyle, nullptr), out_cl);
-            fl_cl = ggml_add(ctx, fl_cl, ggml_reshape_2d(ctx, fbias, 3, 1));
-            ggml_tensor *fl = B.cl_to_sp(fl_cl, r, r);  // [r,r,3]
-            if (skip_flow) fl = ggml_add(ctx, fl, B.upsample2x(skip_flow, fup, masks[j]));
-            skip_flow = fl;
-            snprintf(tn, sizeof tn, "r%d.flowmap", r);
-            reg(tn, fl, {1, 3, r, r});
-
-            ggml_tensor *ch0 = ggml_cont(ctx, ggml_view_2d(ctx, fl, r, r, fl->nb[1], 0));
-            ggml_tensor *ch1 = ggml_cont(ctx, ggml_view_2d(ctx, fl, r, r, fl->nb[1], fl->nb[2]));
-            ggml_tensor *ch2 = ggml_cont(ctx, ggml_view_2d(ctx, fl, r, r, fl->nb[1], 2 * fl->nb[2]));
-            ggml_tensor *gx = ggml_add(ctx, ggml_tanh(ctx, ch0), xs_x[j]);
-            ggml_tensor *gy = ggml_add(ctx, ggml_tanh(ctx, ch1), xs_y[j]);
-            if (with_taps) {
-                ggml_tensor *grid = ggml_concat(ctx, ggml_reshape_3d(ctx, gx, 1, r, r),
-                                                ggml_reshape_3d(ctx, gy, 1, r, r), 0);
-                snprintf(tn, sizeof tn, "r%d.grid", r);
-                reg(tn, grid, {1, r, r, 2});
-            }
-            ggml_tensor *m = ggml_sigmoid(ctx, ch2);  // [r,r]
-            ggml_tensor *m_row = ggml_reshape_2d(ctx, m, 1, N);
-            ggml_tensor *sampled = B.grid_sample_cl(feats[j], gx, gy, r);  // [C, N]
-            ggml_tensor *warp_cl = ggml_mul(ctx, sampled, m_row);
-            if (with_taps) {
-                snprintf(tn, sizeof tn, "r%d.warp", r);
-                reg(tn, B.cl_to_sp(warp_cl, r, r), {1, ST_OC[j], r, r});
-            }
-            ggml_tensor *one_m_row =
-                ggml_reshape_2d(ctx, ggml_scale_bias(ctx, m, -1.0f, 1.0f), 1, N);
-            ggml_tensor *trunk_cl = ggml_add(ctx, warp_cl, ggml_mul(ctx, out_cl, one_m_row));
-            if (with_taps) {
-                snprintf(tn, sizeof tn, "r%d.out", r);
-                reg(tn, B.cl_to_sp(trunk_cl, r, r), {1, ST_OC[j], r, r});
-            }
-
-            // ---- ToRGB(out_warp, skip): 1x1 EqualConv2d == GEMM on warp_cl ----
-            const std::string rbase = br;
             ggml_tensor *rW = B.need(rbase + ".conv.0.weight");
             ggml_tensor *rlb = B.need(rbase + ".conv.1.bias");
             ggml_tensor *rbias = B.need(rbase + ".bias");
             ggml_tensor *rup = B.need(rbase + ".upsample.kernel");
-            if (!rW || !rlb || !rbias || !rup) {
+            if (!s1 || !d1 || !s2 || !d2 || !fstyle || !fW || !fbias || !fup || !rW ||
+                !rlb || !rbias || !rup) {
                 err = B.err;
                 return false;
             }
-            ggml_tensor *rgb_cl = ggml_mul_mat(ctx, B.gemm_weight(rW, nullptr, nullptr), warp_cl);
-            rgb_cl = B.bias_lrelu_cl(rgb_cl, rlb);
-            rgb_cl = ggml_add(ctx, rgb_cl, ggml_reshape_2d(ctx, rbias, 3, 1));
-            ggml_tensor *rgb = B.cl_to_sp(rgb_cl, r, r);
-            if (skip) rgb = ggml_add(ctx, rgb, B.upsample2x(skip, rup, masks[j]));
-            skip = rgb;
-            snprintf(tn, sizeof tn, "r%d.rgb", r);
-            reg(tn, rgb, {1, 3, r, r});
 
-            x_cl = trunk_cl;  // stays channel-last, no transpose
+            bchunks xn{{}, Bc}, skn{{}, Bc}, sfn{{}, Bc};
+            for (int64_t c = 0; c < nch; c++) {
+                ggml_tensor *x_c = cl_slice(x, c, Bc);
+                ggml_tensor *c1_cl =
+                    B.styled_conv_up(x_c, r / 2, r / 2, b1, s1, d1, c, Bc);  // [OC,N,Bc]
+                ggml_tensor *out_cl =
+                    c1_cl ? B.styled_conv(c1_cl, r, r, b2, s2, d2, c, Bc) : nullptr;
+                if (!out_cl) {
+                    err = B.err;
+                    return false;
+                }
+
+                // ToFlow: 1x1 modulated conv == batched GEMM on the CL tensor
+                ggml_tensor *fl_cl = ggml_mul_mat(
+                    ctx, B.gemm_weight(fW, B.bstyle(fstyle, c, Bc), nullptr), out_cl);
+                fl_cl = ggml_add(ctx, fl_cl, ggml_reshape_2d(ctx, fbias, 3, 1));
+                ggml_tensor *fl = B.cl_to_sp(fl_cl, r, r);  // [r,r,3,Bc]
+                if (!skf.t.empty())
+                    fl = ggml_add(ctx, fl,
+                                  B.upsample2x(sp_slice(skf, c, Bc), fup, masks[j]));
+                sfn.t.push_back(fl);
+
+                ggml_tensor *gx = ggml_add(ctx, ggml_tanh(ctx, flch(fl, 0)), xs_x[j]);
+                ggml_tensor *gy = ggml_add(ctx, ggml_tanh(ctx, flch(fl, 1)), xs_y[j]);
+                ggml_tensor *m = ggml_sigmoid(ctx, flch(fl, 2));  // [r,r,Bc]
+                ggml_tensor *m_row = ggml_reshape_3d(ctx, m, 1, N, Bc);
+                ggml_tensor *sampled = B.grid_sample_cl(feats[j], gx, gy, r);  // [C,N,Bc]
+                ggml_tensor *warp_cl = ggml_mul(ctx, sampled, m_row);
+                ggml_tensor *one_m_row = ggml_reshape_3d(
+                    ctx, ggml_scale_bias(ctx, m, -1.0f, 1.0f), 1, N, Bc);
+                ggml_tensor *trunk_cl =
+                    ggml_add(ctx, warp_cl, ggml_mul(ctx, out_cl, one_m_row));
+                xn.t.push_back(trunk_cl);
+
+                // ToRGB(out_warp, skip): 1x1 EqualConv2d == GEMM on warp_cl
+                ggml_tensor *rgb_cl =
+                    ggml_mul_mat(ctx, B.gemm_weight(rW, nullptr, nullptr), warp_cl);
+                rgb_cl = B.bias_lrelu_cl(rgb_cl, rlb);
+                rgb_cl = ggml_add(ctx, rgb_cl, ggml_reshape_2d(ctx, rbias, 3, 1));
+                ggml_tensor *rgb = B.cl_to_sp(rgb_cl, r, r);
+                if (!sk.t.empty())
+                    rgb = ggml_add(ctx, rgb,
+                                   B.upsample2x(sp_slice(sk, c, Bc), rup, masks[j]));
+                skn.t.push_back(rgb);
+            }
+            x = std::move(xn);
+            sk = std::move(skn);
+            skf = std::move(sfn);
         }
 
-
+        // one output per final chunk: frames [i*bc, (i+1)*bc)
+        for (size_t i = 0; i < sk.t.size(); i++) {
+            char nm[16];
+            snprintf(nm, sizeof nm, "img%zu", i);
+            p.output(nm, sk.t[i]);
+        }
+        img_chunks = (int) sk.t.size();
     }
 
-    p.output("img", skip);  // [512,512,3] (truncated when TP_MDEC_STAGES<7)
     if (!B.err.empty()) {
         err = B.err;
         return false;
@@ -777,6 +854,19 @@ bool motion_dec::set_feats(const menc_result &m, std::string &err) {
 
 bool motion_dec::decode(backend_t &be, const float *style, float *img_out,
                         tap_sink &tap, std::string &err) {
+    if (img_chunks > 0) {
+        // fast batched plan: replicate the style across the batch, keep frame 0
+        std::vector<float> styles((size_t) batch * 512);
+        for (int b = 0; b < batch; b++) memcpy(styles.data() + (size_t) b * 512, style, 512 * 4);
+        frame.set("style", styles.data());
+        if (!frame.compute(be, err)) return false;
+        if (img_out) {
+            ggml_tensor *img = frame["img0"];
+            const size_t fsz = ggml_nbytes(img) / (size_t) img->ne[3];
+            ggml_backend_tensor_get(img, img_out, 0, fsz);
+        }
+        return true;
+    }
     frame.set("style", style);
     if (!frame.compute(be, err)) return false;
     if (tap) {
@@ -790,6 +880,34 @@ bool motion_dec::decode(backend_t &be, const float *style, float *img_out,
     if (img_out) {
         ggml_tensor *img = frame["img"];
         ggml_backend_tensor_get(img, img_out, 0, ggml_nbytes(img));
+    }
+    return true;
+}
+
+bool motion_dec::decode_batch(backend_t &be, const float *styles, float *imgs_out,
+                              std::string &err) {
+    if (img_chunks == 0) {
+        // exact plan is batch-1: decode frame by frame
+        tap_sink no_tap;
+        for (int b = 0; b < batch; b++) {
+            const size_t fsz = (size_t) 3 * 512 * 512;
+            if (!decode(be, styles + (size_t) b * 512,
+                        imgs_out ? imgs_out + (size_t) b * fsz : nullptr, no_tap, err))
+                return false;
+        }
+        return true;
+    }
+    frame.set("style", styles);
+    if (!frame.compute(be, err)) return false;
+    if (imgs_out) {
+        size_t off = 0;
+        for (int i = 0; i < img_chunks; i++) {
+            char nm[16];
+            snprintf(nm, sizeof nm, "img%d", i);
+            ggml_tensor *img = frame[nm];
+            ggml_backend_tensor_get(img, imgs_out + off, 0, ggml_nbytes(img));
+            off += (size_t) ggml_nelements(img);
+        }
     }
     return true;
 }
