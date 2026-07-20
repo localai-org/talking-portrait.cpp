@@ -411,6 +411,7 @@ struct mdec_build {
                          ggml_mul(ctx, x_cl, ggml_reshape_3d(ctx, sty, IC, 1, Bc)), W, H, 1);
             y4 = ggml_div(ctx, y4, ggml_reshape_3d(ctx, den4, 4 * OC, 1, Bc));
         }
+        if (fused) return ggml_subpix_lrelu_cl(ctx, y4, ab, (int) W, 0.2f);
         ggml_tensor *cls[4];
         for (int k = 0; k < 4; k++)
             cls[k] = ggml_cont(ctx, ggml_view_3d(ctx, y4, OC, N, Bc, y4->nb[1], y4->nb[2],
@@ -431,6 +432,7 @@ struct mdec_build {
     }
     // upfirdn2d up=2 pad(2,1) with a x4 kernel (Upsample module, 3-channel)
     ggml_tensor *upsample2x(ggml_tensor *x, ggml_tensor *kern, ggml_tensor *mask2x) {
+        if (fused) return ggml_upfirdn2x(ctx, x, kern);
         const int C = (int) x->ne[2];
         ggml_tensor *zs = zero_stuff2(ctx, x, mask2x);
         zs = ggml_pad_ext(ctx, zs, 2, 1, 2, 1, 0, 0, 0, 0);

@@ -84,7 +84,8 @@ static bool node_runs_natively(ggml_backend_t be, const ggml_tensor *n) {
     const bool cf_im2col =
         n->op == GGML_OP_IM2COL && (((const int32_t *) n->op_params)[6] & 2);
     if (cf_im2col || n->op == GGML_OP_BILINEAR_GATHER ||
-        n->op == GGML_OP_BIAS_LRELU || n->op == GGML_OP_SUBPIX_LRELU) {
+        n->op == GGML_OP_BIAS_LRELU || n->op == GGML_OP_SUBPIX_LRELU ||
+        n->op == GGML_OP_SUBPIX_LRELU_CL || n->op == GGML_OP_UPFIRDN2X) {
         // measurement knob: force the custom ops onto the CPU fallback even
         // on backends that have kernels for them (baseline reproduction)
         if (getenv("TP_FORCE_FALLBACK")) return false;
