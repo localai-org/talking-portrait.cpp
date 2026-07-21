@@ -47,6 +47,9 @@ bool backend_t::init(const char *device, int nth, std::string &err) {
         err = "failed to init CPU backend";
         return false;
     }
+    if (nth <= 0) {
+        if (const char *e = getenv("TP_NTHREADS")) nth = atoi(e);
+    }
     n_threads = nth > 0 ? nth : (int) std::thread::hardware_concurrency();
     if (n_threads < 1) n_threads = 4;
     ggml_backend_cpu_set_n_threads(be, n_threads);
