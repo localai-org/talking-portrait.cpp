@@ -195,7 +195,7 @@ index eb8341c9..fc73d1cb 100644
          case GGML_OP_ARANGE:
          case GGML_OP_TIMESTEP_EMBEDDING:
 diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
-index 74611dce..6a01ba73 100644
+index 74611dce..442e98a7 100644
 --- a/src/ggml-cpu/ops.cpp
 +++ b/src/ggml-cpu/ops.cpp
 @@ -6226,15 +6226,17 @@ static void ggml_compute_forward_im2col_f32(
@@ -305,7 +305,7 @@ index 74611dce..6a01ba73 100644
                                      }
                                  }
                              }
-@@ -11485,3 +11501,340 @@ void ggml_compute_forward_fwht(const ggml_compute_params * params, ggml_tensor *
+@@ -11485,3 +11501,349 @@ void ggml_compute_forward_fwht(const ggml_compute_params * params, ggml_tensor *
              }
      }
  }
@@ -589,9 +589,14 @@ index 74611dce..6a01ba73 100644
 +    const int ith = params->ith, nth = params->nth;
 +    const int64_t per = (n_tot + nth - 1) / nth;
 +    const int64_t i0 = ith * per, i1 = i0 + per < n_tot ? i0 + per : n_tot;
-+    for (int64_t i = i0; i < i1; i++) {
-+        const int64_t n = i % N, c = i / N;
-+        y[i] = a[c + C * n] * m[n];
++    // one divmod at the start, then walk contiguous output rows (fixed c) with
++    // an incrementing n — no per-element idiv. Bit-exact vs y[i]=a[c+C*n]*m[n].
++    int64_t c = i0 / N, n = i0 - c * N;
++    for (int64_t i = i0; i < i1;) {
++        const float * ac = a + c;
++        for (; n < N && i < i1; n++, i++) y[i] = ac[C * n] * m[n];
++        n = 0;
++        c++;
 +    }
 +}
 +
@@ -610,9 +615,13 @@ index 74611dce..6a01ba73 100644
 +    const int ith = params->ith, nth = params->nth;
 +    const int64_t per = (n_tot + nth - 1) / nth;
 +    const int64_t i0 = ith * per, i1 = i0 + per < n_tot ? i0 + per : n_tot;
-+    for (int64_t i = i0; i < i1; i++) {
-+        const int64_t n = i % N, c = i / N;
-+        y[i] = a[c + C * n] * m[n] + o[i] * (1.0f - m[n]);
++    int64_t c = i0 / N, n = i0 - c * N;
++    for (int64_t i = i0; i < i1;) {
++        const float * ac = a + c;
++        for (; n < N && i < i1; n++, i++)
++            y[i] = ac[C * n] * m[n] + o[i] * (1.0f - m[n]);
++        n = 0;
++        c++;
 +    }
 +}
 +
