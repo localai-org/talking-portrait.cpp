@@ -19,3 +19,6 @@ bench-vulkan-runs.log
 build-vulkan-stretch.log
 vk-final-runs.log
 parity-dumps-r2-f16/
+parity-dumps-r3-cpu/
+videos-r3-cpu/
+bench-cpu-r3.json
