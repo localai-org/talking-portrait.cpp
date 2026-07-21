@@ -195,7 +195,7 @@ index eb8341c9..fc73d1cb 100644
          case GGML_OP_ARANGE:
          case GGML_OP_TIMESTEP_EMBEDDING:
 diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
-index 74611dce..cb85ea88 100644
+index 74611dce..6a01ba73 100644
 --- a/src/ggml-cpu/ops.cpp
 +++ b/src/ggml-cpu/ops.cpp
 @@ -6226,15 +6226,17 @@ static void ggml_compute_forward_im2col_f32(
@@ -305,7 +305,7 @@ index 74611dce..cb85ea88 100644
                                      }
                                  }
                              }
-@@ -11485,3 +11501,293 @@ void ggml_compute_forward_fwht(const ggml_compute_params * params, ggml_tensor *
+@@ -11485,3 +11501,340 @@ void ggml_compute_forward_fwht(const ggml_compute_params * params, ggml_tensor *
              }
      }
  }
@@ -394,13 +394,38 @@ index 74611dce..cb85ea88 100644
 +
 +    const int ith = params->ith;
 +    const int nth = params->nth;
-+    const int64_t per = (n + nth - 1) / nth;
-+    const int64_t i0 = ith * per, i1 = i0 + per < n ? i0 + per : n;
 +
-+    for (int64_t i = i0; i < i1; i++) {
-+        const int64_t c = axis == 0 ? i % C : (i / d01) % C;
-+        const float v = x[i] + b[c];
-+        y[i] = v > 0.0f ? v : slope * v;
++    // Contiguous src0; the bias index is constant across a contiguous run, so
++    // hoist it out of the inner loop (no per-element idiv) and let -O3
++    // -march=native vectorize the add + leaky-relu. Bit-exact vs the scalar
++    // form (same per-element x[i]+b[c] then compare).
++    if (axis == 0) {
++        // CL layout [C, N, ...]: rows of length C, bias b[c] contiguous
++        const int64_t nrows = n / C;
++        const int64_t per = (nrows + nth - 1) / nth;
++        const int64_t r0 = (int64_t) ith * per, r1 = r0 + per < nrows ? r0 + per : nrows;
++        for (int64_t r = r0; r < r1; r++) {
++            const float * xp = x + r * C;
++            float * yp = y + r * C;
++            for (int64_t c = 0; c < C; c++) {
++                const float v = xp[c] + b[c];
++                yp[c] = v > 0.0f ? v : slope * v;
++            }
++        }
++    } else {
++        // spatial layout [W, H, C, B]: planes of size d01, bias constant per plane
++        const int64_t nplanes = n / d01;  // C * B
++        const int64_t per = (nplanes + nth - 1) / nth;
++        const int64_t p0 = (int64_t) ith * per, p1 = p0 + per < nplanes ? p0 + per : nplanes;
++        for (int64_t p = p0; p < p1; p++) {
++            const float bc = b[p % C];
++            const float * xp = x + p * d01;
++            float * yp = y + p * d01;
++            for (int64_t k = 0; k < d01; k++) {
++                const float v = xp[k] + bc;
++                yp[k] = v > 0.0f ? v : slope * v;
++            }
++        }
 +    }
 +}
 +
@@ -428,16 +453,31 @@ index 74611dce..cb85ea88 100644
 +
 +    const int ith = params->ith;
 +    const int nth = params->nth;
-+    const int64_t per = (n + nth - 1) / nth;
-+    const int64_t i0 = ith * per, i1 = i0 + per < n ? i0 + per : n;
 +
-+    for (int64_t i = i0; i < i1; i++) {
-+        const int64_t xx = i % (2 * W);
-+        const int64_t yy = (i / (2 * W)) % (2 * H);
-+        const int64_t o  = i / (4 * W * H);
-+        const float * g = (const float *) ((yy & 1) ? g1->data : g0->data);
-+        const float v = g[(xx >> 1) + W * ((yy >> 1) + H * (o + OC * (xx & 1)))] + b[o];
-+        y[i] = v > 0.0f ? v : slope * v;
++    // Iterate output rows r=(o,yy); the even/odd output columns interleave two
++    // contiguous source rows (channel o and o+OC). No per-element idiv; the
++    // inner loop is a pair of contiguous loads + interleaved store, bit-exact.
++    const int64_t W2 = 2 * W, H2 = 2 * H;
++    const int64_t nrows = OC * H2;
++    const int64_t per = (nrows + nth - 1) / nth;
++    const int64_t r0 = (int64_t) ith * per, r1 = r0 + per < nrows ? r0 + per : nrows;
++    const float * g0d = (const float *) g0->data;
++    const float * g1d = (const float *) g1->data;
++    for (int64_t r = r0; r < r1; r++) {
++        const int64_t yy = r % H2;
++        const int64_t o  = r / H2;
++        const float bo = b[o];
++        const float * g = (yy & 1) ? g1d : g0d;
++        const int64_t ry = yy >> 1;
++        const float * se = g + W * (ry + H * o);
++        const float * so = g + W * (ry + H * (o + OC));
++        float * out = y + r * W2;
++        for (int64_t nn = 0; nn < W; nn++) {
++            const float v0 = se[nn] + bo;
++            const float v1 = so[nn] + bo;
++            out[2 * nn]     = v0 > 0.0f ? v0 : slope * v0;
++            out[2 * nn + 1] = v1 > 0.0f ? v1 : slope * v1;
++        }
 +    }
 +}
 +
@@ -467,18 +507,25 @@ index 74611dce..cb85ea88 100644
 +
 +    const int ith = params->ith;
 +    const int nth = params->nth;
-+    const int64_t per = (n_tot + nth - 1) / nth;
-+    const int64_t i0 = ith * per, i1 = i0 + per < n_tot ? i0 + per : n_tot;
 +
-+    for (int64_t i = i0; i < i1; i++) {
-+        const int64_t o  = i % OC;
-+        const int64_t t  = i / OC;
-+        const int64_t nn = t % (4 * N);
-+        const int64_t bb = t / (4 * N);
++    // The output's fastest dim is o (channel); for a fixed pixel/batch p the
++    // source is contiguous in o (src + o), so hoist the base pointer out and
++    // vectorize the inner add+leaky-relu over o. Bit-exact.
++    const int64_t npix = n_tot / OC;  // 4N * nb
++    const int64_t four_N = 4 * N;
++    const int64_t per = (npix + nth - 1) / nth;
++    const int64_t p0 = (int64_t) ith * per, p1 = p0 + per < npix ? p0 + per : npix;
++    for (int64_t p = p0; p < p1; p++) {
++        const int64_t nn = p % four_N;
++        const int64_t bb = p / four_N;
 +        const int64_t X = nn % W2, Y = nn / W2;
 +        const int64_t k = (Y & 1) * 2 + (X & 1);
-+        const float v = s0[(o + OC * k) + 4 * OC * ((X >> 1) + Wd * (Y >> 1) + N * bb)] + b[o];
-+        y[i] = v > 0.0f ? v : slope * v;
++        const float * src = s0 + OC * k + 4 * OC * ((X >> 1) + Wd * (Y >> 1) + N * bb);
++        float * out = y + OC * p;
++        for (int64_t o = 0; o < OC; o++) {
++            const float v = src[o] + b[o];
++            out[o] = v > 0.0f ? v : slope * v;
++        }
 +    }
 +}
 +

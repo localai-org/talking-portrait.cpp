@@ -240,6 +240,7 @@ struct mdec_build {
     ggml_tensor *latent = nullptr;  // [512, B]
     ggml_tensor *one = nullptr;     // [1, B] const 1.0
     bool fused = true;              // use the fused bias/lrelu/subpix ops
+    bool wide_up = false;           // CPU: one wide-Cout up-conv (no Vulkan split)
     std::string err;
 
     // Dataflow is CHANNEL-LAST ([C, N, Bc] GEMM outputs); spatial
@@ -501,14 +502,24 @@ struct mdec_build {
         ggml_tensor *den4 = ggml_repeat_4d(ctx, dn, 4 * OC, 1, 1, 1);
         if (fused && !getenv("TP_MDEC_UPSP_MAPSIDE") && !getenv("TP_MDEC_UPSP_CLCONV")) {
             // two half convs (one per row parity; wide-Cout CONV_2D corrupts
-            // on this driver) + fused interleave/bias/lrelu
+            // on the Vulkan driver) + fused interleave/bias/lrelu. On CPU the
+            // wide conv is fine, so run ONE 4OC conv (im2col materialized once,
+            // not twice) and view the two 2OC row-parity halves — bit-exact.
             ggml_tensor *Wf = fold_w4(Ts, sty, den4, false);  // [3,3,IC,4OC]
             ggml_tensor *grp[2];
-            for (int g = 0; g < 2; g++) {
-                ggml_tensor *Wk = ggml_view_4d(ctx, Wf, Wf->ne[0], Wf->ne[1], Wf->ne[2],
-                                               2 * OC, Wf->nb[1], Wf->nb[2], Wf->nb[3],
-                                               (size_t) g * 2 * OC * Wf->nb[3]);
-                grp[g] = ggml_conv_2d_direct(ctx, Wk, x_sp, 1, 1, 1, 1, 1, 1);
+            if (wide_up) {
+                ggml_tensor *y1 = ggml_conv_2d_direct(ctx, Wf, x_sp, 1, 1, 1, 1, 1, 1);
+                for (int g = 0; g < 2; g++)
+                    grp[g] = ggml_view_3d(ctx, y1, y1->ne[0], y1->ne[1], 2 * OC,
+                                          y1->nb[1], y1->nb[2],
+                                          (size_t) g * 2 * OC * y1->nb[2]);
+            } else {
+                for (int g = 0; g < 2; g++) {
+                    ggml_tensor *Wk = ggml_view_4d(ctx, Wf, Wf->ne[0], Wf->ne[1], Wf->ne[2],
+                                                   2 * OC, Wf->nb[1], Wf->nb[2], Wf->nb[3],
+                                                   (size_t) g * 2 * OC * Wf->nb[3]);
+                    grp[g] = ggml_conv_2d_direct(ctx, Wk, x_sp, 1, 1, 1, 1, 1, 1);
+                }
             }
             return ggml_subpix_lrelu(ctx, grp[0], grp[1], ab, 0.2f);
         }
@@ -755,6 +766,8 @@ bool motion_dec::build(backend_t &be, bool with_taps, std::string &err) {
     ggml_context *ctx = p.ctx;
     mdec_build B{p, ctx, w, derived};
     B.fused = !exact_graph && getenv("TP_MDEC_NOFUSED") == nullptr;
+    // CPU can run the wide-Cout up-conv (the 2-way split is a Vulkan workaround)
+    B.wide_up = B.fused && !be.gpu && getenv("TP_MDEC_NOWIDE") == nullptr;
 
     B.latent = p.input("style", ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 512, bsz));
     B.one = ggml_view_2d(ctx, onec, 1, bsz, onec->nb[1], 0);
