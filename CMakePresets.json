@@ -17,7 +17,8 @@
       "binaryDir": "${sourceDir}/build/release",
       "generator": "Ninja",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release"
+        "CMAKE_BUILD_TYPE": "Release",
+        "GGML_LLAMAFILE": "ON"
       }
     },
     {
