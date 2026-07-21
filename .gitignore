@@ -18,3 +18,4 @@ bench-vk-*.json
 bench-vulkan-runs.log
 build-vulkan-stretch.log
 vk-final-runs.log
+parity-dumps-r2-f16/
