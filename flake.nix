@@ -64,7 +64,10 @@
                     --prefix PATH : ${nixpkgs.lib.makeBinPath [ pkgs.ffmpeg ]}
                 '';
 
-                meta.mainProgram = "tp-cli";
+                meta = {
+                  mainProgram = "tp-cli";
+                  license = nixpkgs.lib.licenses.mit;
+                };
               };
         });
     };

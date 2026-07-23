@@ -118,3 +118,35 @@ GPU pool), `fuzz-evidence.txt` (4 targets, >4 CPU-hours).
 tp-cli --gguf <harness>/ggufs --image face.jpg --wav speech_16k.wav \
        --emotion happy --out out.mp4 [--ftype f16] [--device gpu|cpu]
 ```
+
+## WebGL gallery demo
+
+The local demo accepts a portrait plus either an uploaded audio file or a
+browser microphone recording (up to 30 seconds). It generates a synchronized
+MP4 in process through `libtp.so`, then plays that video as the texture of a
+procedural picture frame in a WebGL2 gallery. Completed jobs and their original
+inputs are retained in `generations/` until deleted in the UI.
+
+```sh
+scripts/demo.sh
+# then open http://127.0.0.1:8743
+```
+
+The launcher defaults to `/home/rich/c/float-harness/ggufs`; override
+`GGUF_DIR`, `STORE_DIR`, or `PORT` as needed. It builds both the CUDA shared
+library and Go server inside the pinned demo container. The HTTP server binds
+to localhost by default.
+
+For a native build, configure with `-DTP_SHARED=ON` to produce `libtp.so`;
+ordinary presets continue to build the original static library.
+
+Recording is deliberately finite in this first version: press record, speak,
+then stop to start inference. The current model encodes a complete clip before
+it decodes frames, so continuous live-microphone animation requires a future
+streaming inference API rather than a browser-only change.
+
+## License
+
+MIT (see `LICENSE`). The FLOAT weights this port runs are CC BY-NC —
+weight-derived artifacts (GGUFs, dumps, generated video) must not be
+redistributed; see `NOTICE.md`.
