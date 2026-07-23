@@ -32,19 +32,42 @@ scope).
 
 ## Build
 
-CPU (NixOS host):
+Requirements: CMake >= 3.24, Ninja, a C++17 compiler, and git (the configure
+step applies `patches/ggml-tp-ops.patch` to the ggml submodule on fresh
+checkouts). `tp-cli --out *.mp4` shells out to `ffmpeg` at runtime.
+
 ```sh
-nix shell nixpkgs#cmake nixpkgs#gcc nixpkgs#ninja -c cmake --preset release
-nix shell nixpkgs#cmake nixpkgs#gcc nixpkgs#ninja -c cmake --build --preset release -j
+git clone --recurse-submodules <repo-url> && cd talking-portrait.cpp
+cmake --preset release
+cmake --build --preset release -j
 ```
-CUDA (docker, sm_120):
+
+Presets: `debug` (ASan/UBSan), `release`, `cuda`, `vulkan`, `fuzz`
+(clang+libFuzzer). The `vulkan` preset additionally needs Vulkan headers,
+the loader and `glslc`.
+
+Tests: `TP_GGUF_DIR=<harness>/ggufs TP_REF_DUMPS=<harness>/dumps ctest --test-dir build/release`
+
+### Nix
+
+`flake.nix` provides dev shells with the toolchains above:
+
+```sh
+nix develop           # CPU: cmake, ninja, gcc, git, ffmpeg
+nix develop .#vulkan  # + shaderc (glslc), Vulkan headers/loader
+nix develop .#fuzz    # clang stdenv for the fuzz preset
+```
+
+`nix build '.?submodules=1'` builds the release tools (`tp-cli`, `tp-parity`,
+`tp-bench`, `tp-allocproof`) into `result/bin` (the `?submodules=1` is
+required so the flake source includes the ggml submodule).
+
+### CUDA (docker, sm_120)
+
 ```sh
 docker run --rm --device nvidia.com/gpu=all -v $PWD:/work -w /work trellis2-demo:latest \
     bash -c 'cmake --preset cuda && cmake --build --preset cuda -j$(nproc)'
 ```
-Presets: `debug` (ASan/UBSan), `release`, `cuda`, `fuzz` (clang+libFuzzer).
-
-Tests: `TP_GGUF_DIR=<harness>/ggufs TP_REF_DUMPS=<harness>/dumps ctest --test-dir build/release`
 
 ## ggml patch
 
