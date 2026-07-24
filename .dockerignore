@@ -1,0 +1,12 @@
+.git
+.claude
+build
+build-*
+generations
+parity-dumps*
+videos*
+fuzz-out
+server/talking-portrait-server
+server/talking-portrait-server-linux
+*.log
+*.f32

@@ -1,0 +1,8 @@
+# Local HTTPS for microphone access on a headless demo host. The launcher
+# generates one local-CA certificate containing localhost, the hostname, and
+# every current host IPv4 address. A single certificate also supports IP clients
+# which omit TLS SNI.
+:4001 {
+	tls /data/talking-portrait/server.crt /data/talking-portrait/server.key
+	reverse_proxy talking-portrait-demo-run:4001
+}

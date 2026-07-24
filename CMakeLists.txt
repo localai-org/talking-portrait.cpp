@@ -15,6 +15,7 @@ option(TP_VULKAN      "enable the Vulkan backend (via GGML_VULKAN)" OFF)
 option(TP_FUZZ        "build libFuzzer targets (clang only)"    OFF)
 option(TP_BUILD_TOOLS "build CLI / parity / bench tools"        ON)
 option(TP_BUILD_TESTS "build ctest suite"                       ON)
+option(TP_SHARED      "build tp as a shared library for FFI/demo use" OFF)
 
 if (TP_CUDA)
     set(GGML_CUDA ON CACHE BOOL "" FORCE)
@@ -57,7 +58,13 @@ endif()
 
 add_subdirectory(ggml)
 
-add_library(tp STATIC
+if (TP_SHARED)
+    set(TP_LIBRARY_TYPE SHARED)
+else()
+    set(TP_LIBRARY_TYPE STATIC)
+endif()
+
+add_library(tp ${TP_LIBRARY_TYPE}
     src/tp.cpp
     src/backend.cpp
     src/gguf_load.cpp

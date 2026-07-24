@@ -123,19 +123,53 @@ tp-cli --gguf <harness>/ggufs --image face.jpg --wav speech_16k.wav \
 
 The local demo accepts a portrait plus either an uploaded audio file or a
 browser microphone recording (up to 30 seconds). It generates a synchronized
-MP4 in process through `libtp.so`, then plays that video as the texture of a
-procedural picture frame in a WebGL2 gallery. Completed jobs and their original
-inputs are retained in `generations/` until deleted in the UI.
+MP4 in process through `libtp.so`, then plays that video on the surface inside
+a baked PBR picture frame in a WebGL2 gallery. Completed jobs and their original
+inputs are retained in `generations/` until deleted in the UI. Gallery mode
+hangs every completed portrait along one virtual wall and tours them in order,
+orbiting during playback and looping from the last portrait back to the first.
+Each station instances the baked PBR model in `server/web/picture-frame.glb`.
+The seamless `server/web/wallpaper.png` repeats at a fixed world scale across a
+wall padded beyond both ends of the gallery.
+
+Open `https://<machine-address>:4001/?frameControls=1` to reveal the frame
+calibration form. Its **copy URL** action persists the current values as query
+parameters. The same parameters also work while the form is hidden:
+`frameScale`, `frameX`, `frameY`, `frameZ`, `frameRX`, `frameRY`, `frameRZ`,
+`surfaceX`, `surfaceY`, `surfaceZ`, `surfaceScaleX`, and `surfaceScaleY`.
+Open with `?perf=1` (or press **P**) for a rolling frame-time chart. Green bars
+are portrait playback, amber bars are camera transitions, and the panel reports
+rolling p50/p95 frame times, per-phase FPS, and the visible PBR frame count.
 
 ```sh
 scripts/demo.sh
-# then open http://127.0.0.1:8743
+# then open https://<machine-address>:4001
 ```
 
 The launcher defaults to `/home/rich/c/float-harness/ggufs`; override
 `GGUF_DIR`, `STORE_DIR`, or `PORT` as needed. It builds both the CUDA shared
-library and Go server inside the pinned demo container. The HTTP server binds
-to localhost by default.
+library and Go server inside the pinned demo container. A dedicated Caddy
+sidecar terminates HTTPS on all interfaces while the inference server remains
+private on a Docker network. The demo has no authentication, so restrict port
+4001 with the host firewall unless the surrounding network is trusted.
+On this NixOS host the launcher reuses the installed `trellis2-demo` CUDA image
+through a small derived image that adds ffmpeg and OpenSSL. Native, non-Docker
+runs should use `nix develop`, whose flake shell supplies ffmpeg on `PATH`.
+
+Caddy uses a persistent local CA because LAN and Tailscale IP addresses cannot
+receive public certificates. Install its root certificate on each client
+machine to remove the browser warning and make microphone capture a trusted
+secure context:
+
+```sh
+docker cp talking-portrait-caddy:/data/talking-portrait/root.crt \
+  ./talking-portrait-root.crt
+```
+
+Copy `talking-portrait-root.crt` to the client and import it as a trusted root
+CA. The certificate contains no private key. The launcher regenerates the
+server certificate with localhost, the host name, and all current host IPv4
+addresses whenever it starts.
 
 For a native build, configure with `-DTP_SHARED=ON` to produce `libtp.so`;
 ordinary presets continue to build the original static library.

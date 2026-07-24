@@ -1,0 +1,17 @@
+# CUDA build/runtime for the local talking-portrait.cpp gallery demo.
+# The C++ shared library and Go binary are built inside this same image so their
+# glibc/libstdc++ and CUDA runtime always agree, including on a NixOS host.
+FROM nvidia/cuda:12.8.1-devel-ubuntu22.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG GO_VERSION=1.24.4
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl ffmpeg git g++ make ninja-build openssl python3-pip \
+    && python3 -m pip install --no-cache-dir cmake==3.31.6 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go.tgz \
+    && tar -C /usr/local -xzf /tmp/go.tgz \
+    && rm /tmp/go.tgz
+ENV PATH=/usr/local/go/bin:${PATH}
+WORKDIR /work

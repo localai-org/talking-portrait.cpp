@@ -1,0 +1,10 @@
+# Fast path for machines that already have trellis2-demo (the compatible CUDA
+# build image used by the sibling project). Add the media/certificate tools the
+# talking-portrait server needs without pulling another multi-gigabyte CUDA base.
+ARG BASE_IMAGE=trellis2-demo
+FROM ${BASE_IMAGE}
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ffmpeg openssl \
+    && rm -rf /var/lib/apt/lists/*

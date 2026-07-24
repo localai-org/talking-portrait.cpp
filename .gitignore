@@ -22,3 +22,6 @@ parity-dumps-r2-f16/
 parity-dumps-r3-cpu/
 videos-r3-cpu/
 bench-cpu-r3.json
+server/talking-portrait-server
+server/talking-portrait-server-linux
+generations/
