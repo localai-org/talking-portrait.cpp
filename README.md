@@ -1,5 +1,9 @@
 # talking-portrait.cpp
 
+**Brought to you by the [LocalAI](https://github.com/mudler/LocalAI) team**, the folks behind LocalAI, the open-source AI engine that runs any model (LLMs, vision, voice, image, video) on any hardware, no GPU required.
+
+[![LocalAI](https://img.shields.io/badge/LocalAI-Run_Locally-orange)](https://github.com/mudler/LocalAI)
+
 C++/GGML+CUDA port of [FLOAT](https://github.com/deepbrainai-research/float)
 (audio-driven talking portrait): one 512x512 portrait + 16 kHz speech ->
 25 fps talking-head video. Reference harness: `/home/rich/c/float-harness`
